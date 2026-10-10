@@ -8,6 +8,10 @@ change either way.
 """
 
 from __future__ import annotations
+from elevenlabs.client import ElevenLabs
+import os
+from io import BytesIO
+
 
 import requests
 
@@ -49,6 +53,15 @@ class TtsClient:
         self.timeout_s = timeout_s
         self._session = session or requests.Session()
 
+    def custom_voice(self, ye_neh):
+        if ye_neh:
+            elevenlabs = ElevenLabs(
+                api_key=os.getenv(self._api_key),
+            )
+            self.voice = elevenlabs.voices.ivc.create(
+                name="Tubi's Voice",
+                files = [BytesIO(open("pi_app/config/max.mp3").read())]
+            )
     def synthesize(self, text: str) -> bytes:
         """Returns MP3 bytes, or raises a TtsError subtype."""
         payload = {

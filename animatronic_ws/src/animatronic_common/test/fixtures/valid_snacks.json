@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "default_snack": "none",
+  "snacks": [
+    {
+      "id": "cookies",
+      "label": "Cookies",
+      "slot": 1,
+      "angle": 65,
+      "aliases": ["biscuit"],
+      "tags": ["sweet", "soft", "blue", "rain"],
+      "lines": [{"id": "cookies_1", "text": "Ah, the ancient tides foretell... cookies!"}]
+    },
+    {
+      "id": "candy",
+      "label": "Candy",
+      "slot": 2,
+      "angle": 130,
+      "aliases": ["sweets"],
+      "tags": ["sweet", "colorful"],
+      "lines": [{"id": "candy_1", "text": "A burst of color! The spirits say candy."}]
+    },
+    {
+      "id": "chips",
+      "label": "Chips",
+      "slot": 3,
+      "angle": 195,
+      "aliases": ["crisps"],
+      "tags": ["salty", "crunchy"],
+      "lines": [{"id": "chips_1", "text": "Crunch echoes through the ether... chips!"}]
+    },
+    {
+      "id": "none",
+      "label": "No snack",
+      "slot": 0,
+      "angle": 0,
+      "aliases": [],
+      "tags": [],
+      "lines": [{"id": "none_1", "text": "The spirits are silent... try again, traveler."}]
+    }
+  ]
+}

@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "default_snack": "none",
+  "snacks": [
+    {
+      "id": "cookies",
+      "label": "Cookies",
+      "slot": 1,
+      "angle": 65,
+      "aliases": ["biscuit", "biscuits"],
+      "tags": ["sweet", "soft", "blue", "rain"],
+      "lines": [
+        {"id": "cookies_1", "text": "Ah, the ancient tides foretell... cookies!"},
+        {"id": "cookies_2", "text": "The crystal ball glimmers warm and golden... cookies await."}
+      ]
+    },
+    {
+      "id": "candy",
+      "label": "Candy",
+      "slot": 2,
+      "angle": 130,
+      "aliases": ["sweets", "sweet"],
+      "tags": ["sweet", "colorful", "sugar"],
+      "lines": [
+        {"id": "candy_1", "text": "A burst of color swirls in the mist! The spirits say candy."},
+        {"id": "candy_2", "text": "Sugar and starlight... candy, traveler!"}
+      ]
+    },
+    {
+      "id": "chips",
+      "label": "Chips",
+      "slot": 3,
+      "angle": 195,
+      "aliases": ["crisps"],
+      "tags": ["salty", "crunchy"],
+      "lines": [
+        {"id": "chips_1", "text": "Crunch echoes through the ether... chips!"},
+        {"id": "chips_2", "text": "Salt on the wind carries a sign... chips it is."}
+      ]
+    },
+    {
+      "id": "none",
+      "label": "No snack",
+      "slot": 0,
+      "angle": 0,
+      "aliases": [],
+      "tags": [],
+      "lines": [
+        {"id": "none_1", "text": "The spirits are silent... try again, traveler."},
+        {"id": "none_2", "text": "Hmm, the fog clears to nothing. Ask once more."}
+      ]
+    }
+  ]
+}

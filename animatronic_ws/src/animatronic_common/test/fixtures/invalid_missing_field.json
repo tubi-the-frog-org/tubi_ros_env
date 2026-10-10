@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "default_snack": "none",
+  "snacks": [
+    {
+      "id": "cookies",
+      "slot": 1,
+      "angle": 65,
+      "lines": [{"id": "cookies_1", "text": "Ah, the ancient tides foretell... cookies!"}]
+    }
+  ]
+}

@@ -114,9 +114,12 @@ def main():
     logging.basicConfig(level=logging.INFO)
 
     from pi_app.decision_client import DecisionClient
+    from pi_app.dotenv import load_secrets_env
     from pi_app.esp32_link import NullEspLink, SerialEspLink
     from pi_app.request_budget import CharacterBudget, RequestBudget
     from pi_app.tts_client import TtsClient
+
+    load_secrets_env()
 
     snacks_path = os.environ.get("SNACKS_CONFIG_PATH", "config/snacks.json")
     snacks_store = SnacksStore(snacks_path)

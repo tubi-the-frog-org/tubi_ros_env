@@ -23,12 +23,14 @@ import sys
 
 from pi_app.decision_client import DecisionClient
 from pi_app.decision_service import DecisionService
+from pi_app.dotenv import load_secrets_env
 from pi_app.request_budget import CharacterBudget, RequestBudget
 from pi_app.snacks import SnacksStore
 from pi_app.tts_client import TtsClient
 
 
 def main():
+    load_secrets_env()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--text", help="the text to run through the pipeline")
     parser.add_argument("--json-file", help='a JSON file containing {"text": "..."}')

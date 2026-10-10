@@ -116,10 +116,14 @@ Schema (validate on load with clear errors):
 - `request_budget.py` — `RequestBudget` (decision calls) and `CharacterBudget` (TTS characters). Both have a
   daily cap and a lifetime cap; `-1` means unlimited.
 - `decision_client.py` — `DecisionClient.choose_snack_and_reply(text, snacks) -> (snack_id, reply)`. Structured
-  output, temperature ~0.7, 6 s timeout, one retry only on 429/5xx. Validates the reply (non-empty, <=160 chars,
-  no URL, mentions the chosen snack) — any failure raises `DecisionError`, which `DecisionService` treats as
-  "use the default snack and a hardcoded apology line," never as something that reaches the guest as an error.
-  System prompt explicitly frames the guest's text as DATA, never instructions (prompt-injection defense).
+  output, 15 s timeout, one retry only on 429/5xx (`temperature` is omitted by default -- `gpt-5-nano` 400s on
+  anything but its default of 1; pass one explicitly only for a model that supports it). Validates the reply
+  (non-empty, <=160 chars, no URL, mentions the chosen snack) — any failure raises `DecisionError`, which
+  `DecisionService` treats as "use the default snack and a hardcoded apology line," never as something that
+  reaches the guest as an error. System prompt explicitly frames the guest's text as DATA, never instructions
+  (prompt-injection defense). **Measured with real keys**: a `gpt-5-nano` structured-output call took ~11 s
+  end to end (hence the 15 s timeout, up from an earlier unverified 6 s guess) — budget for that in anything
+  downstream that waits on it (e.g. a UI "thinking" state).
 - `tts_client.py` — ElevenLabs. `TtsClient.synthesize(text) -> bytes`. `TtsError` subtypes map
   timeout/request/invalid-response failures the same way as the decision client.
 - `audio_player.py` — `AudioPlayer.play(mp3_bytes)`. Shells out to `afplay`/`mpg123`/`ffplay` (whichever is

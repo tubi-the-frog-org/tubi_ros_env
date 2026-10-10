@@ -58,6 +58,38 @@ code/decisions that look like they contradict each other:
    code-enforced turn counter: a nudge after 4 turns, a structurally-forced `done=true` after 6 (the schema
    locks it, not just a prompt request), and a local hard-finalize with no further LLM call if even that
    fails — a demo must never hang on an uncooperative model.
+6. **Several rounds of real-voice testing reshaped the system prompt** (`_SYSTEM_PROMPT_TEMPLATE` in
+   `decision_client.py`) and added a real cloned voice. In order, each measured against live calls/real mic
+   audio, not just reasoned about:
+   - Personality rewrite: Tubi is goofy-but-smart/eccentric (not constantly joking or prophetic), does a quick
+     one-line intro with a froggy sound ("ribbit"/"croak"), then asks simple X-or-Y questions (e.g. "cats or
+     dogs?") one at a time so the guest never has to think hard about an answer. During questions he reacts to
+     the previous answer in very few words before asking the next one, for fluidity — a linked research paper
+     (PMC4981440) that was supposed to ground the question-asking approach could not actually be read (blocked
+     by a reCAPTCHA) and, more fundamentally, can't be read by the model either (no URL fetching in a plain
+     chat completion call) — dropped, the X-or-Y structure stands on its own.
+   - "Ask a few questions" / "reveal when confident" were, again, too soft — tightened to an explicit "at most
+     4 questions, treat a 5th as a mistake." Still not perfectly reliable on its own (real trials: anywhere from
+     exactly 4 to one or two over), which is exactly why the code-enforced cap from pivot #5 still matters as
+     the real backstop.
+   - **Guest answers come from speech-to-text and will often be garbled, mistranscribed, or off-topic** —
+     measured a real failure mode where a mistranscribed stray character got taken literally and the model
+     hallucinated an entire new unrelated question out of it, derailing the rest of the conversation. The
+     prompt now explicitly says answers may be garbled, not to take them literally, and to rephrase or move on
+     rather than spiraling.
+   - **Reveals kept naming only 1 snack** even with a healthy spread across percentages (e.g. 85/40/25/20) —
+     "include every snack whose score is genuinely high enough" was too vague and the model defaulted to the
+     single top pick every time. Replaced with a concrete, checkable rule: include every snack scoring >=60.
+     Verified this actually produces 2-3 snack reveals now, matching the original multi-snack intent from #5.
+   - **Voice cloning**: `tools/clone_voice.py` (new) is a one-time setup script — NOT something the running
+     service ever calls — that uploads a local audio sample (`config/max.mp3`) via the `elevenlabs` SDK
+     (`tools/requirements-voice-clone.txt`, kept out of core `requirements.txt` same as the mic tooling) and
+     prints a `voice_id` to put in `secrets.env` as `TTS_VOICE_ID`. Two real bugs fixed getting this working:
+     the ElevenLabs API key needed its `Voices` permission raised from "No Access" to "Write" on their
+     dashboard (an account-side fix, not code), and the installed `elevenlabs` SDK (2.71.0) has a bug where
+     omitting the `labels` argument (or passing `None`) fails server-side with "Labels must be serialized
+     dictionary object" instead of being treated as absent — an explicit `labels={}` works around it. A real
+     cloned voice now exists and is wired in and verified producing audio.
 
 ## Measured facts about the Pi (do not assume otherwise)
 - Raspberry Pi 3, 905 MiB RAM, aarch64, Raspberry Pi OS (Debian trixie), hostname `max`, user `maxwelllokshin`,
@@ -102,12 +134,12 @@ speak only the mystical reply while also embedding a machine-parseable snack id 
 garbling the spoken line or needing fragile parsing. Two clean calls — a cheap structured-output decision call
 (`gpt-5-nano`), then a dedicated TTS call — is simpler and keeps each call's job single-purpose.
 
-### Why ElevenLabs for TTS, and not a cloned voice yet
+### Why ElevenLabs for TTS
 Switched from OpenAI's `/audio/speech` to ElevenLabs specifically because ElevenLabs supports voice cloning and
-OpenAI's TTS voices don't — this is a deliberate stepping stone. Today it uses a stock premade voice (`"Adam"`,
-id `pNInz6obpgDQGcFmaJgB`) steered via `stability`/`similarity_boost`. `TtsClient` only depends on a
-`synthesize(text) -> bytes` shape, so swapping `voice_id` for a real cloned "frog wizard" voice later is a
-one-line config change, not a redesign.
+OpenAI's TTS voices don't. A real cloned voice now exists (see History #6) — `TtsClient` only ever depended on
+a `synthesize(text) -> bytes` shape regardless, so going from the stock `"Adam"` voice (id
+`pNInz6obpgDQGcFmaJgB`) to the cloned one was a one-line config change (`TTS_VOICE_ID` in `secrets.env`), not a
+redesign. `tools/clone_voice.py` is how the clone itself gets created — see `pi_app/` layout below.
 
 ## Config: `pi_app/config/snacks.json` (single source of truth, editable when real snacks change)
 Schema (validate on load with clear errors):
@@ -201,12 +233,18 @@ Schema (validate on load with clear errors):
   approach, so it doesn't spend API credits on transcription) — no website, ESP32, or Pi needed. Needs
   `tools/requirements-mic.txt` installed separately (SpeechRecognition/pyaudio/openai-whisper — deliberately
   NOT in `requirements.txt`, since whisper pulls in torch and has no business running on a Pi 3).
+- `tools/clone_voice.py` — one-time setup, not a runtime path: uploads `config/max.mp3` via the `elevenlabs`
+  SDK to create a cloned voice, prints the resulting `voice_id` to put in `secrets.env` as `TTS_VOICE_ID`. Needs
+  `tools/requirements-voice-clone.txt` (same "separate from core requirements" pattern). Passes `labels={}`
+  explicitly to `voices.ivc.create()` — required, not optional, due to an SDK bug (see History #6).
 
 ## Secrets
-`LLM_API_KEY` (decision calls, OpenAI-compatible), `TTS_API_KEY` (ElevenLabs) — from env or an untracked
-`secrets.env` (`pi_app/secrets.env.example` is the template), never a hardcoded value, never logged above DEBUG.
-`WEBSITE_WS_URL` and `ESP32_SERIAL_PORT` are plain config, not secrets, but also env-driven (see
-`secrets.env.example`) so nothing is hardcoded.
+`LLM_API_KEY` (decision calls, OpenAI-compatible), `TTS_API_KEY` (ElevenLabs — needs the `Voices: Write`
+permission on the dashboard if you ever need to re-run `tools/clone_voice.py`, not just text-to-speech) — from
+env or an untracked `secrets.env` (`pi_app/secrets.env.example` is the template), never a hardcoded value,
+never logged above DEBUG. `TTS_VOICE_ID` is set to the real cloned "Tubi" voice (see History #6) — not a
+secret itself, but lives in `secrets.env` alongside the keys since it's config, not committed content.
+`WEBSITE_WS_URL` and `ESP32_SERIAL_PORT` are plain config too, also env-driven, so nothing is hardcoded.
 
 ## What's missing / still open
 - The `speak` message and `display.percentages` addition (`pi_app/docs/multi_turn_contract_proposal.md`) aren't

@@ -1,0 +1,22 @@
+/**:
+  ros__parameters:
+    # Single source of truth for snack data; shared with esp32_bridge and speech.
+    snacks_config_path: "config/snacks.json"
+    reload_poll_interval_s: 2.0
+
+    # Step 2: keyword scoring thresholds (see keyword_scorer.py).
+    keyword_threshold: 1
+    keyword_margin: 1
+
+    # Step 3: Ollama. All params here so a tuning change needs no code edit.
+    ollama_base_url: "http://localhost:11434"
+    ollama_model: "qwen2.5:0.5b"
+    ollama_timeout_s: 45.0
+    ollama_num_predict: 16
+    ollama_num_ctx: 1024
+    ollama_keep_alive: -1
+    health_check_interval_s: 30.0
+
+    # Step 5: experimental free-form prose instead of a pre-written line.
+    # Per measured facts the 0.5b model can't do this coherently -- off by default.
+    llm_reply: false

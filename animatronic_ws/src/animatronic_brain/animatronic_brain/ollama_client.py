@@ -1,5 +1,7 @@
-"""Step 3 of the brain pipeline: ask Ollama to pick one snack id from
-an enumerated JSON schema. Pure Python, no ROS dependency.
+"""The optional `local` provider: ask Ollama to pick one snack id from
+an enumerated JSON schema. Off by default (see CLAUDE.md's cloud-LLM
+update) -- `local` only picks the snack, the line is always
+pre-written, never LLM prose. Pure Python, no ROS dependency.
 """
 
 from __future__ import annotations
@@ -75,18 +77,17 @@ class OllamaClient:
             "num_ctx": self.num_ctx,
         }
 
-    def _chat(self, messages: list[dict], format_schema: dict | None, num_predict: int | None = None) -> str:
+    def _chat(self, messages: list[dict], format_schema: dict) -> str:
         """POST /api/chat and return the raw message content string, or
         raise an OllamaError subtype."""
         payload = {
             "model": self.model,
             "messages": messages,
+            "format": format_schema,
             "stream": False,
             "keep_alive": self.keep_alive,
-            "options": {**self._options(), "num_predict": num_predict or self.num_predict},
+            "options": self._options(),
         }
-        if format_schema is not None:
-            payload["format"] = format_schema
 
         try:
             resp = self._session.post(
@@ -128,25 +129,6 @@ class OllamaClient:
             raise OllamaInvalidResponseError(f"Ollama chose '{choice}', which is not in {snack_ids}")
 
         return choice
-
-    def generate_prose_reply(self, user_text: str, snack: Snack, num_predict: int | None = None) -> str:
-        """Experimental free-form path (llm_reply=true): ask the model to
-        write the spoken line itself instead of using a pre-written one.
-        Per measured facts, the 0.5B model is not expected to do this
-        coherently — this exists for experimentation, not default use."""
-        system_prompt = (
-            "You are a carnival wizard. In one short dramatic sentence, "
-            f"announce that the guest's snack is: {snack.label}."
-        )
-        content = self._chat(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
-            ],
-            format_schema=None,
-            num_predict=num_predict,
-        )
-        return content.strip()
 
     def health_check(self, timeout_s: float = 5.0) -> bool:
         try:

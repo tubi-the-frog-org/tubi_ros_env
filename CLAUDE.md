@@ -135,12 +135,15 @@ Schema (validate on load with clear errors):
     re-normalized in code (`_normalize_percentages`) to always sum to 100, since the model's raw numbers often
     don't.
   Both: 15 s timeout, one retry only on 429/5xx (`temperature` omitted by default — `gpt-5-nano` 400s on
-  anything but its default of 1). Reply validation (non-empty, no URL; <=160 chars + must-mention-the-snack
-  only for a one-shot reply or a `done=true` reveal line; a more lenient length-only cap for intermediate
-  conversational turns) — any failure raises `DecisionError`, treated as "say a hardcoded apology line," never
-  something that reaches the guest as a crash. System prompt frames the guest's text as DATA, never
-  instructions (prompt-injection defense). **Measured with real keys**: a `gpt-5-nano` structured-output call
-  took ~11 s end to end (hence the 15 s timeout) — budget for that downstream (e.g. a UI "thinking" state).
+  anything but its default of 1; `reasoning_effort` defaults to `"low"`). Reply validation (non-empty, no URL;
+  <=160 chars + must-mention-the-snack only for a one-shot reply or a `done=true` reveal line; a more lenient
+  length-only cap for intermediate conversational turns) — any failure raises `DecisionError`, treated as "say
+  a hardcoded apology line," never something that reaches the guest as a crash. System prompt frames the
+  guest's text as DATA, never instructions (prompt-injection defense). **Measured with real keys**:
+  `reasoning_effort` matters a lot for GPT-5-family models — default effort took ~11-20 s/call; `"minimal"`
+  dropped that to ~2 s/call but was unreliable (3/5 trials never actually committed to a snack on reveal,
+  staying `"undecided"`); `"low"` lands at ~3-8 s/call with 10/11 trials completing successfully. `"low"` is
+  the default; `"minimal"` is tempting for speed but measurably trades away correctness on this task.
 - `conversation_session.py` — `ConversationSession`, one per guest: owns the growing chat-history list,
   `.start()` kicks off Tubi's intro, `.respond(guest_text)` feeds one guest turn and returns Tubi's next line.
   When a turn comes back `done=true`, `.result` is set to a `QuizResult` (session_id, chosen_snack_id, slot,

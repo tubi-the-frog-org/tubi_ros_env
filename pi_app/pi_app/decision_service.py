@@ -46,17 +46,20 @@ class DecisionService:
                 f"(daily={self._request_budget.daily_count}/{self._request_budget.daily_limit}, "
                 f"total={self._request_budget.total_count}/{self._request_budget.total_limit})"
             )
-            return SnackMessage(request_id, snacks.default_snack, _BUDGET_EXCEEDED_REPLY, None, SOURCE_FALLBACK_BUDGET)
+            default_snack = snacks.get(snacks.default_snack)
+            return SnackMessage(request_id, default_snack.id, default_snack.slot, _BUDGET_EXCEEDED_REPLY, None, SOURCE_FALLBACK_BUDGET)
 
         try:
             snack_id, reply_text = self._decision_client.choose_snack_and_reply(raw_text, snacks.snacks)
         except DecisionError as e:
             self._logger.warning(f"[{request_id}] decision call failed: {e}")
-            return SnackMessage(request_id, snacks.default_snack, _DECISION_ERROR_REPLY, None, SOURCE_FALLBACK_ERROR)
+            default_snack = snacks.get(snacks.default_snack)
+            return SnackMessage(request_id, default_snack.id, default_snack.slot, _DECISION_ERROR_REPLY, None, SOURCE_FALLBACK_ERROR)
 
+        snack = snacks.get(snack_id)
         audio = self._try_synthesize(request_id, reply_text)
         source = SOURCE_OK if audio is not None else SOURCE_OK_NO_AUDIO
-        return SnackMessage(request_id, snack_id, reply_text, audio, source)
+        return SnackMessage(request_id, snack.id, snack.slot, reply_text, audio, source)
 
     def _try_synthesize(self, request_id: str, reply_text: str) -> bytes | None:
         if not self._character_budget.try_consume(len(reply_text)):

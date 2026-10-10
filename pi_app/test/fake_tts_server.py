@@ -1,7 +1,7 @@
-"""Minimal fake OpenAI-compatible HTTP server for TTS client tests.
-Serves POST /audio/speech returning scripted raw bytes (standing in
-for MP3 data) or an error status, with an optional artificial delay
-for timeout tests.
+"""Minimal fake ElevenLabs-shaped HTTP server for TTS client tests.
+Serves POST /text-to-speech/<voice_id> returning scripted raw bytes
+(standing in for MP3 data) or an error status, with an optional
+artificial delay for timeout tests.
 """
 
 from __future__ import annotations
@@ -17,6 +17,8 @@ class FakeTtsServer:
         self.status_code = status_code
         self.delay_s = delay_s
         self.call_count = 0
+        self.last_path: str | None = None
+        self.last_headers = None
         self.last_payload: bytes | None = None
         self._lock = threading.Lock()
         self._server: HTTPServer | None = None
@@ -35,7 +37,7 @@ class FakeTtsServer:
                 pass
 
             def do_POST(self):
-                if self.path != "/audio/speech":
+                if not self.path.startswith("/text-to-speech/"):
                     self.send_response(404)
                     self.end_headers()
                     return
@@ -44,6 +46,8 @@ class FakeTtsServer:
                 body = self.rfile.read(length)
                 with server._lock:
                     server.call_count += 1
+                    server.last_path = self.path
+                    server.last_headers = {k.lower(): v for k, v in self.headers.items()}
                     server.last_payload = body
 
                 if server.delay_s:

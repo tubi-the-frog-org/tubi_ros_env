@@ -7,3 +7,4 @@ __pycache__/
 *.pyc
 
 secrets.env
+pi_app/tools/output.mp3

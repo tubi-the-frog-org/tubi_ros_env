@@ -30,7 +30,6 @@ def test_parse_valid_config():
     assert config.ids() == ["cookies", "candy", "chips", "none"]
     cookies = config.get("cookies")
     assert cookies.slot == 1
-    assert cookies.angle == 65.0
     assert cookies.aliases == ["biscuit"]
     assert cookies.lines[0].text.startswith("Ah, the ancient tides")
     assert "cookies" in config
@@ -72,10 +71,10 @@ def test_non_dict_root_raises():
         parse_snacks(["not", "a", "dict"])
 
 
-def test_bad_angle_type_raises():
+def test_bad_slot_type_raises():
     data = _valid_data()
-    data["snacks"][0]["angle"] = "sixty-five"
-    with pytest.raises(SnacksConfigError, match="angle"):
+    data["snacks"][0]["slot"] = "one"
+    with pytest.raises(SnacksConfigError, match="slot"):
         parse_snacks(data)
 
 

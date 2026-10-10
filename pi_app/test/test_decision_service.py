@@ -10,8 +10,8 @@ from pi_app.request_budget import CharacterBudget, RequestBudget
 from pi_app.snacks import Line, Snack, SnacksConfig
 from pi_app.tts_client import TtsError
 
-COOKIES = Snack(id="cookies", label="Cookies", slot=1, angle=65, aliases=[], tags=[], lines=[])
-NONE = Snack(id="none", label="No snack", slot=0, angle=0, aliases=[], tags=[], lines=[])
+COOKIES = Snack(id="cookies", label="Cookies", slot=1, aliases=[], tags=[], lines=[])
+NONE = Snack(id="none", label="No snack", slot=0, aliases=[], tags=[], lines=[])
 SNACKS = SnacksConfig(version=1, default_snack="none", snacks=[COOKIES, NONE])
 
 
@@ -54,6 +54,7 @@ def test_success_path_includes_audio():
     service = _service()
     message = service.handle("req-1", "anything", SNACKS)
     assert message.snack_id == "cookies"
+    assert message.slot == 1
     assert message.reply_text == "The cookies call to you!"
     assert message.audio_mp3 == b"mp3-bytes"
     assert message.source == SOURCE_OK
@@ -67,6 +68,7 @@ def test_request_budget_exhausted_skips_decision_and_tts_entirely():
     message = service.handle("req-2", "anything", SNACKS)
 
     assert message.snack_id == "none"  # default_snack
+    assert message.slot == 0
     assert message.source == SOURCE_FALLBACK_BUDGET
     assert message.audio_mp3 is None
     assert decision_client.calls == 0
@@ -81,6 +83,7 @@ def test_decision_error_falls_back_and_skips_tts():
     message = service.handle("req-3", "anything", SNACKS)
 
     assert message.snack_id == "none"
+    assert message.slot == 0
     assert message.source == SOURCE_FALLBACK_ERROR
     assert message.audio_mp3 is None
     assert tts_client.calls == []

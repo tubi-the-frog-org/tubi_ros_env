@@ -23,7 +23,6 @@ class Snack:
     id: str
     label: str
     slot: int
-    angle: float
     aliases: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
     lines: list[Line] = field(default_factory=list)
@@ -74,9 +73,6 @@ def _parse_snack(raw: object, index: int) -> Snack:
     slot = raw.get("slot")
     _require(isinstance(slot, int) and not isinstance(slot, bool), f"snack '{snack_id}'.slot must be an integer")
 
-    angle = raw.get("angle")
-    _require(isinstance(angle, (int, float)) and not isinstance(angle, bool), f"snack '{snack_id}'.angle must be a number")
-
     aliases = raw.get("aliases", [])
     _require(isinstance(aliases, list) and all(isinstance(a, str) for a in aliases), f"snack '{snack_id}'.aliases must be a list of strings")
 
@@ -91,7 +87,6 @@ def _parse_snack(raw: object, index: int) -> Snack:
         id=snack_id,
         label=label,
         slot=slot,
-        angle=float(angle),
         aliases=aliases,
         tags=tags,
         lines=lines,

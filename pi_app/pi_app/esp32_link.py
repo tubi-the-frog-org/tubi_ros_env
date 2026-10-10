@@ -1,30 +1,42 @@
-"""Sends a SnackMessage to the ESP32: a newline-delimited JSON header
-(request_id, snack_id, audio byte count) followed by that many raw
-audio bytes if present. This is a minimal placeholder protocol, not
-the real spec -- esp32_bridge/docs/esp32_protocol.md (still unwritten)
-is where the actual wire protocol, chunking/flow-control for audio,
-and ESP32-side ack/heartbeat handling belong. The point here is just
-giving the Pi side a clean, testable interface to write against.
+"""Talks to the real ESP32 firmware (esp32_firmware/src/motor_esp2).
+
+That firmware's app_main() reads ONE raw byte at a time off UART0 at
+115200 baud -- no JSON, no header, no ack:
+    b'1' -> trap door closes
+    b'2' -> trap door opens
+Anything else is ignored. There is no per-snack slot routing yet (the
+firmware's LAZY_POS_1..4 constants for a rotating tray exist but
+aren't wired to any input), so for now this can only open/close the
+one door -- it can't yet pick a slot. SnackMessage.slot is carried
+through the rest of the pipeline so that routing is a small addition
+here once the firmware supports it, not a redesign.
 """
 
 from __future__ import annotations
 
-import json
 from abc import ABC, abstractmethod
 
-from pi_app.message_package import SnackMessage
+OPEN_BYTE = b"2"
+CLOSE_BYTE = b"1"
 
 
 class EspLink(ABC):
     @abstractmethod
-    def send(self, message: SnackMessage) -> None:
+    def open_trap_door(self) -> None:
+        ...
+
+    @abstractmethod
+    def close_trap_door(self) -> None:
         ...
 
 
 class NullEspLink(EspLink):
     """No-op link for dev/test when no ESP32 is attached."""
 
-    def send(self, message: SnackMessage) -> None:
+    def open_trap_door(self) -> None:
+        pass
+
+    def close_trap_door(self) -> None:
         pass
 
 
@@ -35,15 +47,11 @@ class SerialEspLink(EspLink):
             serial_factory = serial.Serial
         self._conn = serial_factory(port, baudrate, timeout=timeout_s)
 
-    def send(self, message: SnackMessage) -> None:
-        header = {
-            "request_id": message.request_id,
-            "snack_id": message.snack_id,
-            "audio_len": len(message.audio_mp3) if message.audio_mp3 else 0,
-        }
-        self._conn.write((json.dumps(header) + "\n").encode("utf-8"))
-        if message.audio_mp3:
-            self._conn.write(message.audio_mp3)
+    def open_trap_door(self) -> None:
+        self._conn.write(OPEN_BYTE)
+
+    def close_trap_door(self) -> None:
+        self._conn.write(CLOSE_BYTE)
 
     def close(self) -> None:
         self._conn.close()

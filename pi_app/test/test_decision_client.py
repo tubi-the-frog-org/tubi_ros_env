@@ -13,9 +13,9 @@ from pi_app.decision_client import (
 )
 from fake_decision_server import FakeDecisionServer
 
-COOKIES = Snack(id="cookies", label="Cookies", slot=1, angle=65,
+COOKIES = Snack(id="cookies", label="Cookies", slot=1,
                  aliases=["biscuit"], tags=["sweet"], lines=[Line(id="cookies_1", text="cookies!")])
-CHIPS = Snack(id="chips", label="Chips", slot=3, angle=195,
+CHIPS = Snack(id="chips", label="Chips", slot=3,
               aliases=["crisps"], tags=["salty", "crunchy"], lines=[Line(id="chips_1", text="chips!")])
 SNACKS = [COOKIES, CHIPS]
 

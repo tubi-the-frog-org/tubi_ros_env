@@ -1,22 +1,19 @@
-"""Text-to-speech via an OpenAI-compatible /audio/speech endpoint.
+"""Text-to-speech via the ElevenLabs API.
 
-Note: this uses a stock voice + `instructions` to steer tone (mystical
-carnival wizard), not a cloned custom voice -- OpenAI's TTS endpoint
-only offers a fixed voice list. If a genuinely custom cloned voice
-matters more than staying on one provider/key, swap this client for an
-ElevenLabs-style voice-cloning provider instead; the DecisionService
-only depends on the synthesize(text) -> bytes shape below, so that's a
-drop-in replacement, not a redesign.
+Uses a stock premade voice for now, steered toward a wizard-ish read
+via voice_settings -- not a cloned custom voice yet. When a real
+cloned "frog wizard" voice is ready, swap `voice_id` for the cloned
+voice's id; TtsClient's shape (synthesize(text) -> bytes) doesn't
+change either way.
 """
 
 from __future__ import annotations
 
 import requests
 
-_DEFAULT_INSTRUCTIONS = (
-    "Speak like a mystical carnival wizard addressing a guest: warm, "
-    "theatrical, a little dramatic, but still clear and brief."
-)
+# "Adam" -- a default ElevenLabs premade voice available on every
+# account. Swap for a cloned voice_id once one exists.
+_DEFAULT_VOICE_ID = "pNInz6obpgDQGcFmaJgB"
 
 
 class TtsError(Exception):
@@ -37,34 +34,39 @@ class TtsClient:
         base_url: str,
         model: str,
         api_key: str,
-        voice: str = "fable",
-        instructions: str | None = _DEFAULT_INSTRUCTIONS,
+        voice_id: str = _DEFAULT_VOICE_ID,
+        stability: float = 0.5,
+        similarity_boost: float = 0.6,
         timeout_s: float = 10.0,
         session: requests.Session | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self._api_key = api_key
-        self.voice = voice
-        self.instructions = instructions
+        self.voice_id = voice_id
+        self.stability = stability
+        self.similarity_boost = similarity_boost
         self.timeout_s = timeout_s
         self._session = session or requests.Session()
 
     def synthesize(self, text: str) -> bytes:
         """Returns MP3 bytes, or raises a TtsError subtype."""
         payload = {
-            "model": self.model,
-            "input": text,
-            "voice": self.voice,
-            "response_format": "mp3",
+            "text": text,
+            "model_id": self.model,
+            "voice_settings": {
+                "stability": self.stability,
+                "similarity_boost": self.similarity_boost,
+            },
         }
-        if self.instructions:
-            payload["instructions"] = self.instructions
+        headers = {
+            "xi-api-key": self._api_key,
+            "Content-Type": "application/json",
+        }
 
-        headers = {"Authorization": f"Bearer {self._api_key}"}
         try:
             resp = self._session.post(
-                f"{self.base_url}/audio/speech",
+                f"{self.base_url}/text-to-speech/{self.voice_id}",
                 json=payload,
                 headers=headers,
                 timeout=self.timeout_s,

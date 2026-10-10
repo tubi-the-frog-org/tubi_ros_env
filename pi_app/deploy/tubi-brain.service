@@ -1,0 +1,18 @@
+[Unit]
+Description=Tubi brain (pi_app: LLM + TTS + speaker + ESP32)
+After=network-online.target tubi-web.service
+Wants=network-online.target tubi-web.service
+
+[Service]
+User=maxwelllokshin
+# relative paths (config/snacks.json, tools/quiz_result.json) resolve from here
+WorkingDirectory=/home/maxwelllokshin/tubi_ros_env/pi_app
+EnvironmentFile=/home/maxwelllokshin/tubi_ros_env/pi_app/secrets.env
+ExecStart=/home/maxwelllokshin/tubi_ros_env/pi_app/.venv/bin/python -m pi_app.teammate_client
+Restart=always
+RestartSec=3
+# serial port + audio device access
+SupplementaryGroups=dialout audio
+
+[Install]
+WantedBy=multi-user.target

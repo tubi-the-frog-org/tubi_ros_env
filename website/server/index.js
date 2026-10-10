@@ -3,25 +3,100 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
-import { writeFileSync, existsSync } from 'node:fs';
+import { writeFileSync, existsSync, appendFileSync, mkdirSync } from 'node:fs';
 import os from 'node:os';
 import { WebSocketServer } from 'ws';
+import { SessionLock } from './session-lock.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, '..');
 const distDir = path.join(rootDir, 'dist');
+const transcriptOutputPath = path.join(rootDir, 'output', 'transcripts.jsonl');
+
+const appendTranscriptFile = (text) => {
+  const outputDir = path.dirname(transcriptOutputPath);
+  mkdirSync(outputDir, { recursive: true });
+  appendFileSync(
+    transcriptOutputPath,
+    `${JSON.stringify({ timestamp: new Date().toISOString(), text })}\n`,
+    'utf8'
+  );
+};
+
+const resetTranscriptFile = () => {
+  mkdirSync(path.dirname(transcriptOutputPath), { recursive: true });
+  writeFileSync(transcriptOutputPath, '', 'utf8');
+};
+
+const STT_FAILURE_TEXT = /^(Speech transcription failed|No audio|I could not understand the audio)/;
+
+// Speech-to-text. With STT_API_KEY (or LLM_API_KEY) set, audio goes to an
+// OpenAI-compatible /audio/transcriptions endpoint: no Whisper/torch on the Pi
+// (a Pi 3's 905 MiB can't afford it). Without a key it falls back to the
+// local Whisper worker, which is fine on a dev laptop.
+const sttApiKey = process.env.STT_API_KEY || process.env.LLM_API_KEY || '';
+const sttBaseUrl = (process.env.STT_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '');
+const sttModel = process.env.STT_MODEL || 'gpt-4o-mini-transcribe';
+
+const transcribeInCloud = async (audioBuffer, mimeType, extension) => {
+  const form = new FormData();
+  form.append('file', new Blob([audioBuffer], { type: mimeType }), `speech.${extension}`);
+  form.append('model', sttModel);
+  form.append('language', 'en');
+  const response = await fetch(`${sttBaseUrl}/audio/transcriptions`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${sttApiKey}` },
+    body: form,
+    signal: AbortSignal.timeout(20_000)
+  });
+  if (!response.ok) {
+    throw new Error(`cloud transcription failed (HTTP ${response.status})`);
+  }
+  const body = await response.json();
+  return { text: String(body.text ?? '').trim() };
+};
+
+const transcribeWithLocalWhisper = async (audioBuffer, extension) => {
+  const audioPath = path.join(os.tmpdir(), `tubi-audio-${Date.now()}.${extension}`);
+  writeFileSync(audioPath, audioBuffer);
+  const pythonScript = path.join(rootDir, 'python', 'stt_worker.py');
+  return new Promise((resolve, reject) => {
+    const child = spawn('.venv/bin/python', [pythonScript, audioPath], { cwd: rootDir, env: process.env });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+    child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+    child.on('close', (code) => {
+      if (code !== 0) return reject(new Error(stderr || 'python transcription failed'));
+      try {
+        resolve(JSON.parse(stdout));
+      } catch {
+        reject(new Error('invalid json response from python stt worker'));
+      }
+    });
+  });
+};
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-const lock = {
-  active: false,
-  sessionId: null,
-  startedAt: null,
-  lastHeartbeat: null,
-  clientId: null
+const getDuration = (name, fallback) => {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+};
+
+const sessionLock = new SessionLock({
+  idleTimeoutMs: getDuration('SESSION_IDLE_TIMEOUT_MS', 60_000),
+  maxDurationMs: getDuration('SESSION_MAX_DURATION_MS', 180_000)
+});
+let devBusySessionId = null;
+
+const clearExpiredDevBusy = () => {
+  if (devBusySessionId && !sessionLock.isOwner(devBusySessionId)) {
+    devBusySessionId = null;
+  }
 };
 
 const broadcast = (type, payload = {}) => {
@@ -33,90 +108,227 @@ const broadcast = (type, payload = {}) => {
   }
 };
 
-const publishState = () => {
-  broadcast('session-state', {
-    state: lock.active ? 'active' : 'idle',
-    sessionId: lock.sessionId,
-    startedAt: lock.startedAt,
-    clientId: lock.clientId
-  });
+// The Pi-side service (pi_app/teammate_client.py) connects with ?role=teammate.
+// It gets the conversation events the browsers must not see (a browser would
+// render a guest transcript as a duplicate line).
+const toTeammate = (type, payload = {}) => {
+  const message = JSON.stringify({ type, payload, sentAt: Date.now() });
+  for (const client of wss.clients) {
+    if (client.readyState === 1 && client.role === 'teammate') {
+      client.send(message);
+    }
+  }
 };
 
-app.use(express.json({ limit: '1mb' }));
-app.use(express.raw({ type: '*/*', limit: '10mb' }));
+// Guests may not talk while Tubi is thinking or speaking. Set when a turn is
+// handed to the Pi, cleared when the Pi reports it finished ({"type":"state",
+// "payload":{"speaking":false}}), the Pi disconnects, the session ends, or
+// the safety timeout fires (so a crashed turn can never lock the guest out).
+const TUBI_TURN_TIMEOUT_MS = Number(process.env.TUBI_TURN_TIMEOUT_MS) || 60_000;
+let tubiBusy = false;
+let tubiBusyTimer = null;
+
+const teammateConnected = () =>
+  [...wss.clients].some((client) => client.readyState === 1 && client.role === 'teammate');
+
+const setTubiBusy = (busy) => {
+  clearTimeout(tubiBusyTimer);
+  if (busy) {
+    tubiBusyTimer = setTimeout(() => setTubiBusy(false), TUBI_TURN_TIMEOUT_MS);
+    tubiBusyTimer.unref();
+  }
+  if (busy === tubiBusy) return;
+  tubiBusy = busy;
+  broadcast('tubi-state', { busy });
+};
+
+const finishSession = () => {
+  resetTranscriptFile();
+  toTeammate('session:end');
+  setTubiBusy(false);
+};
+
+const publishState = () => {
+  broadcast('session-state', sessionLock.snapshot());
+};
+
+const expiryTimer = setInterval(() => {
+  if (sessionLock.expireIfNeeded()) {
+    clearExpiredDevBusy();
+    finishSession();
+    publishState();
+  }
+}, 5_000);
+expiryTimer.unref();
+
+app.use(express.json({ limit: '10mb' }));
 
 app.get('/api/health', (_, res) => {
-  res.json({ ok: true, state: lock.active ? 'active' : 'idle' });
+  if (sessionLock.expireIfNeeded()) {
+    finishSession();
+    publishState();
+  }
+  clearExpiredDevBusy();
+  res.json({ ok: true, ...sessionLock.snapshot(), devBusy: Boolean(devBusySessionId) });
 });
 
-app.post('/api/session/start', (req, res) => {
-  if (lock.active) {
+app.post('/api/session/start', (_, res) => {
+  if (sessionLock.expireIfNeeded()) {
+    finishSession();
+    publishState();
+  }
+  const session = sessionLock.start();
+  if (!session) {
     return res.status(409).json({ ok: false, error: 'frog busy' });
   }
 
-  const sessionId = `session-${Date.now()}`;
-  lock.active = true;
-  lock.sessionId = sessionId;
-  lock.startedAt = Date.now();
-  lock.lastHeartbeat = Date.now();
-  lock.clientId = req.body?.clientId ?? 'unknown-client';
-
+  resetTranscriptFile();
+  toTeammate('session:start', { sessionId: session.sessionId });
+  if (teammateConnected()) setTubiBusy(true);
   publishState();
-  res.json({ ok: true, sessionId, status: 'active' });
+  res.json({ ok: true, ...session, status: 'active' });
 });
 
-app.post('/api/session/end', (_, res) => {
-  lock.active = false;
-  lock.sessionId = null;
-  lock.startedAt = null;
-  lock.lastHeartbeat = null;
-  lock.clientId = null;
+app.post('/api/session/resume', (req, res) => {
+  if (sessionLock.expireIfNeeded()) {
+    finishSession();
+    publishState();
+  }
+  const session = sessionLock.resume(req.body?.sessionId);
+  if (!session) {
+    return res.status(409).json({ ok: false, error: 'session expired or not owned by this tab' });
+  }
 
+  res.json({ ok: true, ...session, status: 'active' });
+});
+
+app.post('/api/session/heartbeat', (req, res) => {
+  if (sessionLock.expireIfNeeded()) {
+    finishSession();
+    publishState();
+  }
+  if (!sessionLock.heartbeat(req.body?.sessionId)) {
+    return res.status(409).json({ ok: false, error: 'session expired or not owned by this tab' });
+  }
+
+  res.json({ ok: true });
+});
+
+app.post('/api/session/end', (req, res) => {
+  if (sessionLock.expireIfNeeded()) {
+    finishSession();
+    publishState();
+  }
+  if (!sessionLock.end(req.body?.sessionId)) {
+    return res.status(409).json({ ok: false, error: 'session expired or not owned by this tab' });
+  }
+
+  finishSession();
   publishState();
   res.json({ ok: true, status: 'idle' });
 });
 
+app.post('/api/session/reset', (_, res) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ ok: false, error: 'not found' });
+  }
+
+  sessionLock.forceEnd();
+  devBusySessionId = null;
+  finishSession();
+  publishState();
+  res.json({ ok: true, status: 'idle' });
+});
+
+app.post('/api/dev/session/busy', (req, res) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(404).json({ ok: false, error: 'not found' });
+  }
+
+  if (sessionLock.expireIfNeeded()) {
+    finishSession();
+    publishState();
+  }
+  clearExpiredDevBusy();
+
+  if (req.body?.busy) {
+    if (!devBusySessionId) {
+      const session = sessionLock.start();
+      if (!session) {
+        return res.status(409).json({ ok: false, error: 'another session already owns the lock' });
+      }
+      devBusySessionId = session.sessionId;
+      publishState();
+    }
+  } else if (devBusySessionId) {
+    const released = sessionLock.end(devBusySessionId);
+    devBusySessionId = null;
+    if (released) publishState();
+  }
+
+  res.json({
+    ok: true,
+    devBusy: Boolean(devBusySessionId),
+    ...sessionLock.snapshot()
+  });
+});
+
 app.post('/api/transcribe', async (req, res) => {
   try {
-    if (!req.body || req.body.length === 0) {
+    if (sessionLock.expireIfNeeded()) publishState();
+    if (!sessionLock.heartbeat(req.body?.sessionId)) {
+      return res.status(409).json({ ok: false, error: 'active session required' });
+    }
+    if (tubiBusy) {
+      return res.status(409).json({ ok: false, error: 'Tubi is speaking', tubiBusy: true });
+    }
+
+    if (!req.body || (typeof req.body === 'object' && Object.keys(req.body).length === 0)) {
       return res.status(400).json({ ok: false, error: 'missing audio payload' });
     }
 
-    const audioPath = path.join(os.tmpdir(), `tubi-audio-${Date.now()}.webm`);
-    writeFileSync(audioPath, req.body);
+    let audioBuffer;
+    let mimeType = 'audio/webm';
+    let extension = 'webm';
 
-    const pythonScript = path.join(rootDir, 'python', 'stt_worker.py');
-    const result = await new Promise((resolve, reject) => {
-      const child = spawn('python3', [pythonScript, audioPath], {
-        cwd: rootDir,
-        env: process.env
-      });
+    const candidate =
+      (typeof req.body === 'object' && req.body !== null && 'audioBase64' in req.body)
+        ? req.body.audioBase64
+        : (typeof req.body === 'object' && req.body !== null && 'audio' in req.body)
+          ? req.body.audio
+          : undefined;
 
-      let stdout = '';
-      let stderr = '';
+    if (Buffer.isBuffer(req.body)) {
+      audioBuffer = req.body;
+    } else if (typeof candidate === 'string') {
+      mimeType = req.body.mimeType || 'audio/webm';
+      extension = req.body.extension || (mimeType.includes('wav') ? 'wav' : 'webm');
+      const base64Data = candidate.replace(/^data:audio\/[a-zA-Z0-9.+-]+;base64,/, '');
+      audioBuffer = Buffer.from(base64Data, 'base64');
+    } else if (typeof req.body === 'string') {
+      audioBuffer = Buffer.from(req.body, 'base64');
+    } else if (ArrayBuffer.isView(req.body) || req.body instanceof ArrayBuffer) {
+      audioBuffer = Buffer.from(req.body);
+    } else {
+      audioBuffer = Buffer.from(JSON.stringify(req.body));
+    }
 
-      child.stdout.on('data', (chunk) => {
-        stdout += chunk.toString();
-      });
+    const result = sttApiKey
+      ? await transcribeInCloud(audioBuffer, mimeType, extension)
+      : await transcribeWithLocalWhisper(audioBuffer, extension);
 
-      child.stderr.on('data', (chunk) => {
-        stderr += chunk.toString();
-      });
+    if (!sessionLock.heartbeat(req.body.sessionId)) {
+      return res.status(409).json({ ok: false, error: 'session ended before transcription completed' });
+    }
 
-      child.on('close', (code) => {
-        if (code !== 0) {
-          return reject(new Error(stderr || 'python transcription failed'));
-        }
-
-        try {
-          resolve(JSON.parse(stdout));
-        } catch (error) {
-          reject(new Error('invalid json response from python stt worker'));
-        }
-      });
-    });
-
-    res.json({ ok: true, text: result.text || 'I did not catch that clearly.' });
+    const text = result.text || 'I did not catch that clearly.';
+    appendTranscriptFile(text);
+    // stt_worker.py reports its own failures as plain text; don't feed those to Tubi.
+    if (result.text && !STT_FAILURE_TEXT.test(result.text)) {
+      if (teammateConnected()) setTubiBusy(true);
+      toTeammate('transcript', { text: result.text, isFinal: true, timestamp: Date.now() });
+    }
+    res.json({ ok: true, text });
   } catch (error) {
     res.status(500).json({
       ok: false,
@@ -142,33 +354,22 @@ app.post('/api/dev/transcript', (req, res) => {
   res.json({ ok: true, text });
 });
 
-wss.on('connection', (socket) => {
-  socket.send(JSON.stringify({ type: 'session-state', payload: { state: lock.active ? 'active' : 'idle' } }));
+wss.on('connection', (socket, req) => {
+  const role = new URL(req.url ?? '/', 'http://localhost').searchParams.get('role');
+  socket.role = role === 'teammate' ? 'teammate' : 'browser';
+  socket.send(JSON.stringify({ type: 'session-state', payload: sessionLock.snapshot() }));
+  socket.send(JSON.stringify({ type: 'tubi-state', payload: { busy: tubiBusy } }));
+  socket.on('close', () => {
+    if (socket.role === 'teammate' && !teammateConnected()) setTubiBusy(false);
+  });
 
   socket.on('message', (raw) => {
     try {
       const data = JSON.parse(raw.toString());
 
-      if (data.type === 'session:start') {
-        lock.active = true;
-        lock.sessionId = data.payload?.sessionId ?? `session-${Date.now()}`;
-        lock.startedAt = Date.now();
-        lock.lastHeartbeat = Date.now();
-        lock.clientId = data.payload?.clientId ?? 'ws-client';
-        publishState();
-      }
-
-      if (data.type === 'session:end') {
-        lock.active = false;
-        lock.sessionId = null;
-        lock.startedAt = null;
-        lock.lastHeartbeat = null;
-        lock.clientId = null;
-        publishState();
-      }
-
-      if (data.type === 'heartbeat') {
-        lock.lastHeartbeat = Date.now();
+      if (socket.role === 'teammate' && data.type === 'state' && data.payload?.speaking === false) {
+        setTubiBusy(false);
+        return;
       }
 
       if (data.type === 'transcript') {

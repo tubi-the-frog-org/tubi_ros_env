@@ -1,0 +1,13 @@
+[Unit]
+Description=Cloudflare quick tunnel (public HTTPS for the phone's mic)
+After=network-online.target tubi-web.service
+Wants=network-online.target
+
+[Service]
+User=maxwelllokshin
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --url http://localhost:3000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

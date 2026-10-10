@@ -228,7 +228,8 @@ async def test_character_budget_exhausted_skips_audio(snacks_store, tmp_path):
     await client.handle_message(ws, json.dumps({"type": "session:start", "payload": {}}))
 
     assert audio_player.played == []
-    assert not any(m["type"] == "state" for m in ws.sent)
+    states = [m["payload"]["speaking"] for m in ws.sent if m["type"] == "state"]
+    assert states == [False]  # turn-over signal still sent so the website unlocks the talk button
 
 
 async def test_real_websocket_roundtrip(snacks_store, tmp_path):

@@ -146,7 +146,15 @@ class TeammateClient:
 
     async def _speak_turn(self, ws, text: str):
         await ws.send_json({"type": "speak", "payload": {"text": text}})
+        try:
+            await self._synthesize_and_play(ws, text)
+        finally:
+            # Always tell the website the turn is over (even with no audio:
+            # budget exhausted, TTS failure) -- it keeps the guest's talk
+            # button disabled until it hears this.
+            await ws.send_json({"type": "state", "payload": {"speaking": False}})
 
+    async def _synthesize_and_play(self, ws, text: str):
         loop = asyncio.get_running_loop()
         audio = None
         if self._character_budget.try_consume(len(text)):
@@ -164,7 +172,6 @@ class TeammateClient:
             word_ms = word_durations_ms(text, estimate_audio_seconds(audio))
             await loop.run_in_executor(None, self._esp32_link.talk, word_ms)
             await loop.run_in_executor(None, self._audio_player.play, audio)
-            await ws.send_json({"type": "state", "payload": {"speaking": False}})
 
     async def _reveal(self, ws, result: QuizResult):
         await ws.send_json({
@@ -225,7 +232,7 @@ def main():
     esp32_link = SerialEspLink(esp32_port) if esp32_port else NullEspLink() # link the serial port of esp
 
     client = TeammateClient( # this is the conversational part
-        ws_url=os.environ.get("WEBSITE_WS_URL", "ws://localhost:3000"),
+        ws_url=os.environ.get("WEBSITE_WS_URL", "ws://localhost:3000/?role=teammate"),
         decision_client=decision_client,
         tts_client=tts_client,
         request_budget=RequestBudget(daily_limit=int(os.environ.get("LLM_DAILY_REQUEST_CAP", "300"))),

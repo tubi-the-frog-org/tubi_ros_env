@@ -1,0 +1,76 @@
+{
+  "session_id": "73333c76-58e4-4e10-99b0-01678101f510",
+  "chosen_snacks": [
+    {
+      "id": "popcorn",
+      "slot": 2,
+      "label": "popcorn"
+    },
+    {
+      "id": "pretzels",
+      "slot": 3,
+      "label": "pretzels"
+    },
+    {
+      "id": "goldfish",
+      "slot": 3,
+      "label": "goldfish"
+    }
+  ],
+  "percentages": {
+    "m&ms": 0.0,
+    "popcorn": 70.0,
+    "pretzels": 60.0,
+    "goldfish": 50.0
+  },
+  "transcript": [
+    {
+      "role": "user",
+      "content": "(The guest has just arrived and hasn't said anything yet. Begin: introduce yourself with your usual mixed-up backstory, then ask them to introduce themselves.)"
+    },
+    {
+      "role": "assistant",
+      "content": "I am Tubi, the wandering wizard frog who once sailed a thundercloud to fetch a moonbeam, though I later discovered it was merely a very polite lamp in a balloon. My robes are stitched with the whispers of ancient ponds, and I forget whether I learned the spell yesterday or the day before yesterday\u2014my memory takes tea with the mist and forgets to wake up. Ah, but enough about my grand misadventures: tell me, traveler, please introduce yourself."
+    },
+    {
+      "role": "user",
+      "content": "I like trees."
+    },
+    {
+      "role": "assistant",
+      "content": "What\u2019s your favorite thing to do on a sunny day?"
+    },
+    {
+      "role": "user",
+      "content": "Sitting down."
+    },
+    {
+      "role": "assistant",
+      "content": "What\u2019s your favorite way to spend a day?"
+    },
+    {
+      "role": "user",
+      "content": "Danavo played Man Did Dan go for a movie? Oh, wait I mean I'm, covered, he couldn't play.ops."
+    },
+    {
+      "role": "assistant",
+      "content": "Do you prefer quiet moments alone or lively times with others?"
+    },
+    {
+      "role": "user",
+      "content": "You saw it!"
+    },
+    {
+      "role": "assistant",
+      "content": "Interesting. What\u2019s something you\u2019re curious about right now?"
+    },
+    {
+      "role": "user",
+      "content": "So that is something to go off of."
+    },
+    {
+      "role": "assistant",
+      "content": "The forest fog knows which crumbs you seek, and it whispers of popcorn, pretzels, and goldfish guiding you to calm adventures."
+    }
+  ]
+}

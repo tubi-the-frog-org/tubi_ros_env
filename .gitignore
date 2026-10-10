@@ -8,3 +8,4 @@ __pycache__/
 
 secrets.env
 pi_app/tools/output.mp3
+.DS_Store

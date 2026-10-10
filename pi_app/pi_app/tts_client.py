@@ -1,10 +1,11 @@
 """Text-to-speech via the ElevenLabs API.
 
-Uses a stock premade voice for now, steered toward a wizard-ish read
-via voice_settings -- not a cloned custom voice yet. When a real
-cloned "frog wizard" voice is ready, swap `voice_id` for the cloned
-voice's id; TtsClient's shape (synthesize(text) -> bytes) doesn't
-change either way.
+Uses a stock premade voice by default, steered toward a wizard-ish
+read via voice_settings. To use a cloned voice instead, run
+tools/clone_voice.py once (a separate one-time setup action, not
+something this client does at runtime) and set TTS_VOICE_ID to the
+id it prints. TtsClient's shape (synthesize(text) -> bytes) doesn't
+change either way -- voice_id is just a constructor argument.
 """
 
 from __future__ import annotations

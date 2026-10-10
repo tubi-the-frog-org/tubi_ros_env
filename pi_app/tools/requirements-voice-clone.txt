@@ -1,0 +1,5 @@
+# Only for tools/clone_voice.py -- a one-time setup action, not part of
+# the runtime TTS path (tts_client.py talks to ElevenLabs directly via
+# plain requests, no SDK needed there). Install into pi_app's venv:
+#   .venv/bin/pip install -r tools/requirements-voice-clone.txt
+elevenlabs>=1.0

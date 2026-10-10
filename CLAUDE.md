@@ -39,15 +39,25 @@ code/decisions that look like they contradict each other:
 5. **Replaced the one-shot "text in, snack+reply out" shape with a real multi-turn conversation.** Tubi now
    introduces himself (with a running joke: he always gets one detail of his own backstory comically wrong),
    asks the guest to introduce themselves, asks a few open-ended personality/feeling questions of his own
-   choosing, waits for an explicit confirmation, then reveals a snack with a personality-test-style percentage
-   breakdown across every snack — not just the winner. One endpoint, one schema, grown to support this: the
-   `{"snack","reply"}` schema gained `done` (keep talking vs. reveal now) and `percentages`, since a single
-   call can no longer always commit to a snack. `conversation_session.py` owns the growing chat history;
+   choosing (terse and direct here, deliberately NOT theatrical — the monologue is reserved for the intro and
+   reveal), then reveals **on his own confidence, not on request** — there's no "are you ready?" gate; the
+   guest never has to ask for or confirm the result, he just decides (by his 2nd-3rd answer, 4th at the
+   latest) and says it, like a friend reading someone's vibe rather than a quiz show waiting to be told to
+   give the answer. The reveal can name **one snack or several** (up to all of them) with an independent 0-100
+   confidence score per snack — NOT a split of 100 across all snacks, since a guest can genuinely score high
+   on more than one at once (e.g. 70% one snack AND 65% another, both true simultaneously). One endpoint, one
+   schema, grown to support this: `{"snacks": [...], "reply", "done", "percentages"}` — `snacks` is a list,
+   not a single id, and empty while `done=false`. `conversation_session.py` owns the growing chat history;
    `DecisionClient.converse()` is the call. `website/docs/message-contract.md` only documents the old one-shot
    shape, so `teammate_client.py` now sends a `speak` message per turn and an extended `display` — see
    `pi_app/docs/multi_turn_contract_proposal.md` for exactly what the website side needs to add to really drive
    this (not yet built there). `tools/talk_to_tubi.py` exercises the whole conversation locally, by voice, using
    the dev machine's own microphone + local Whisper STT — no website, ESP32, or Pi needed to test it.
+   A prompt instruction alone ("ask 2-4 questions", "reveal when confident") was measured NOT reliable enough on
+   its own — a real run asked 10+ questions without ever revealing. `ConversationSession` backs this with a
+   code-enforced turn counter: a nudge after 4 turns, a structurally-forced `done=true` after 6 (the schema
+   locks it, not just a prompt request), and a local hard-finalize with no further LLM call if even that
+   fails — a demo must never hang on an uncooperative model.
 
 ## Measured facts about the Pi (do not assume otherwise)
 - Raspberry Pi 3, 905 MiB RAM, aarch64, Raspberry Pi OS (Debian trixie), hostname `max`, user `maxwelllokshin`,
@@ -68,14 +78,17 @@ pi_app/teammate_client.py -- connects OUT to the website's WS hub as "the teamma
         v
 ConversationSession (pi_app/conversation_session.py), one per guest, owns the growing chat history:
   per turn -> RequestBudget check -> DecisionClient.converse(history, snacks)
-              -> {"done": bool, "snack": enum|"undecided", "reply": string, "percentages": {...}}
+              -> {"done": bool, "snacks": [enum, ...], "reply": string, "percentages": {...}}
+              (snacks is a LIST -- empty while done=false, one or more when done=true; Tubi decides to
+              reveal on his own confidence, there is no "are you ready?" confirmation step)
   every turn -> CharacterBudget check -> TtsClient.synthesize(reply) -> mp3 bytes (ElevenLabs)
         |
         +--> every turn: ws.send_json({"type":"speak","payload":{"text":reply}}),
         |    {"type":"state","payload":{"speaking":...}}, AudioPlayer.play(audio) on the Pi's own speaker
-        +--> only on done=true: {"type":"display","payload":{"kind":"result","snack":...,"percentages":{...}}},
-             EspLink.open_trap_door()/close_trap_door() (single ASCII byte over serial), write the
-             QuizResult JSON to tools/quiz_result.json
+        +--> only on done=true: {"type":"display","payload":{"kind":"result","snacks":[...],"percentages":{...}}},
+             EspLink.open_trap_door()/close_trap_door() ONCE regardless of how many snacks were chosen
+             (single ASCII byte over serial -- only one physical mechanism exists), write the QuizResult
+             JSON to tools/quiz_result.json
 ```
 The guest-facing frontend lives entirely in `website/` (a teammate's). The HTTPS-for-mic-access requirement and
 the website's own hosting choice are that teammate's call per `website/CLAUDE.md` — read it before assuming
@@ -130,26 +143,37 @@ Schema (validate on load with clear errors):
 - `decision_client.py` — two call shapes against the same OpenAI-compatible endpoint:
   - `choose_snack_and_reply(text, snacks) -> (snack_id, reply)` — the original one-shot shape. Still used by
     `decision_service.py`/`tools/try_request.py` for a quick single-question test in isolation.
-  - `converse(messages, snacks) -> ConversationTurn` — the real multi-turn shape, used by
-    `ConversationSession`. Schema adds `done` and `percentages` (see History #5). Percentages are
-    re-normalized in code (`_normalize_percentages`) to always sum to 100, since the model's raw numbers often
-    don't.
+  - `converse(messages, snacks, force_done=False) -> ConversationTurn` — the real multi-turn shape, used by
+    `ConversationSession`. Schema adds `done` and `snacks` (a LIST, not a single id, since a guest can match
+    more than one -- see History #5) and `percentages` (independent 0-100 confidence per snack id, clamped but
+    deliberately NOT rescaled to sum to 100 — `_clamp_percentages`, not `_normalize_percentages`).
+    `force_done=True` locks `done`'s schema to literally only accept `true`, used once a conversation has run
+    long (see `ConversationSession`'s question cap below) — a prompt instruction alone wasn't reliably enough.
   Both: 15 s timeout, one retry only on 429/5xx (`temperature` omitted by default — `gpt-5-nano` 400s on
   anything but its default of 1; `reasoning_effort` defaults to `"low"`). Reply validation (non-empty, no URL;
-  <=160 chars + must-mention-the-snack only for a one-shot reply or a `done=true` reveal line; a more lenient
-  length-only cap for intermediate conversational turns) — any failure raises `DecisionError`, treated as "say
-  a hardcoded apology line," never something that reaches the guest as a crash. System prompt frames the
-  guest's text as DATA, never instructions (prompt-injection defense). **Measured with real keys**:
+  <=160 chars + must-mention-at-least-one-chosen-snack for a one-shot reply or a `done=true` reveal line, via
+  `validate_reveal_reply` — mention-matching normalizes punctuation first, e.g. label `"m&ms"` still matches a
+  reply naturally written `"M&M's"`; a more lenient length-only cap for intermediate conversational turns,
+  truncated at a sentence/word boundary rather than discarded) — any failure raises `DecisionError`, treated
+  as "say a varied, in-character goofy retry line," never something that reaches the guest as a crash. System
+  prompt frames the guest's text as DATA, never instructions (prompt-injection defense). **Measured with real
+  keys**:
   `reasoning_effort` matters a lot for GPT-5-family models — default effort took ~11-20 s/call; `"minimal"`
   dropped that to ~2 s/call but was unreliable (3/5 trials never actually committed to a snack on reveal,
   staying `"undecided"`); `"low"` lands at ~3-8 s/call with 10/11 trials completing successfully. `"low"` is
   the default; `"minimal"` is tempting for speed but measurably trades away correctness on this task.
 - `conversation_session.py` — `ConversationSession`, one per guest: owns the growing chat-history list,
   `.start()` kicks off Tubi's intro, `.respond(guest_text)` feeds one guest turn and returns Tubi's next line.
-  When a turn comes back `done=true`, `.result` is set to a `QuizResult` (session_id, chosen_snack_id, slot,
-  percentages, transcript) and further `.respond()` calls raise. On a `DecisionError`, rolls back the
-  just-appended guest turn before returning a fallback line, so a failed call doesn't poison the history the
-  next real call sees.
+  When a turn comes back `done=true`, `.result` is set to a `QuizResult` (session_id, `chosen_snacks: list[
+  ChosenSnack]` — one or more, each with id/slot/label — percentages, transcript) and further `.respond()`
+  calls raise. On a `DecisionError`, rolls back the just-appended guest turn before returning a varied
+  `_GOOFY_RETRY_REPLIES` line, so a failed call doesn't poison the history the next real call sees.
+  Code-enforced question cap (a prompt instruction alone measured unreliable — a real run asked 10+ questions
+  without ever revealing): a `_turn_count` tracks turns after the intro; past `_NUDGE_AFTER_TURNS` (4), a
+  one-off system reminder is appended to that call only (never persisted to history); past
+  `_FORCE_AFTER_TURNS` (6), `force_done=True` is passed so the schema itself locks `done=true`; if even that
+  call fails (measured: possible — the model can still fail the reveal's content validation), `_finalize_locally()`
+  picks one snack itself with no further LLM call, guaranteeing the session always terminates.
 - `tts_client.py` — ElevenLabs. `TtsClient.synthesize(text) -> bytes`. `TtsError` subtypes map
   timeout/request/invalid-response failures the same way as the decision client.
 - `audio_player.py` — `AudioPlayer.play(mp3_bytes)`. Shells out to `afplay`/`mpg123`/`ffplay` (whichever is
@@ -160,14 +184,15 @@ Schema (validate on load with clear errors):
   a real conversation anymore (see `teammate_client.py`/`conversation_session.py`).
 - `esp32_link.py` — `EspLink` interface (`open_trap_door()`/`close_trap_door()`), `NullEspLink` (dev/no
   hardware), `SerialEspLink` (pyserial, writes a single `b'1'`/`b'2'` byte at 115200 baud — matches the real
-  firmware exactly, see History #4). No per-slot routing yet; `QuizResult.slot` is unused here until the
-  firmware grows that.
+  firmware exactly, see History #4). No per-slot routing yet; `ChosenSnack.slot` is unused here until the
+  firmware grows that, and only one trap door is pulsed regardless of how many snacks were chosen digitally.
 - `teammate_client.py` — `TeammateClient`, an `aiohttp` WS **client** connecting OUT to `WEBSITE_WS_URL`.
   `session:start` creates a `ConversationSession` and speaks its intro; `transcript` feeds the active session
-  and speaks the reply; on `done`, sends the extended `display` (with `percentages`), pulses the trap door
-  (`DISPENSE_OPEN_SECONDS`), and writes the `QuizResult` to `tools/quiz_result.json`. Both the decision call and
-  the TTS call are budget-gated per turn (`RequestBudget`/`CharacterBudget`), degrading to a fallback line or
-  text-only rather than erroring. Auto-reconnects with a fixed delay on disconnect.
+  and speaks the reply; on `done`, sends the extended `display` (`snacks: [...]` labels + `percentages`),
+  pulses the trap door once (`DISPENSE_OPEN_SECONDS`), and writes the `QuizResult` to `tools/quiz_result.json`.
+  Both the decision call and the TTS call are budget-gated per turn (`RequestBudget`/`CharacterBudget`),
+  degrading to a fallback line or text-only rather than erroring. Auto-reconnects with a fixed delay on
+  disconnect.
 - `tools/try_request.py` — standalone CLI, no website/ESP32 needed: runs one piece of text through the real
   one-shot `DecisionService` (real API calls) and prints the resulting package + saves the audio to a file.
   Good for a quick isolated check of the decision+TTS pipeline, not the real conversation.

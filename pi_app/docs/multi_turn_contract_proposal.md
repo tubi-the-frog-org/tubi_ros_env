@@ -9,10 +9,11 @@ this (or something like it) is actually built on the website side.
 ## What changed on the Pi side
 
 The brain is no longer "one transcript in, one final result out." It's a real back-and-forth: Tubi
-introduces himself, asks the guest to introduce themselves, asks a few open-ended questions, waits
-for a confirmation word, then reveals a snack with percentages. Every one of those Tubi lines needs
-to reach the browser and be spoken, not just the final result — and the browser needs to know when
-to re-arm the mic for the next answer.
+introduces himself, asks the guest to introduce themselves, asks a few open-ended questions, then
+reveals **on his own confidence, usually by the 3rd-4th answer** — there's no "are you ready?" gate
+or confirmation word; the browser should not expect or wait for one. Every one of those Tubi lines
+needs to reach the browser and be spoken, not just the final result — and the browser needs to know
+when to re-arm the mic for the next answer.
 
 ## New message: teammate -> server -> browser
 
@@ -20,26 +21,28 @@ to re-arm the mic for the next answer.
 {"type": "speak", "payload": {"text": "Ah, greetings traveler! I am Tubi, three hundred years old... or was it just last Tuesday?"}}
 ```
 
-Sent for every Tubi turn, intro through confirmation prompt. The browser should display this text
-and treat it the same way it currently treats "Tubi is speaking" — and once speaking ends, go back
-to listening for the guest's next answer (previously only "session end" meant "stop listening";
-now the browser needs to listen again after every `speak`, until the final `display` result).
+Sent for every Tubi turn, intro through the reveal itself. The browser should display this text and
+treat it the same way it currently treats "Tubi is speaking" — and once speaking ends, go back to
+listening for the guest's next answer (previously only "session end" meant "stop listening"; now the
+browser needs to listen again after every `speak`, until the final `display` result arrives).
 
-## Changed message: the final `display` result now carries percentages
+## Changed message: the final `display` result can now name more than one snack, plus percentages
 
 ```json
 {
   "type": "display",
   "payload": {
     "kind": "result",
-    "snack": "Chips",
-    "percentages": {"chips": 62.0, "cookies": 25.0, "popcorn": 13.0}
+    "snacks": ["Chips", "M&Ms"],
+    "percentages": {"chips": 82.0, "m&ms": 78.0, "cookies": 25.0, "popcorn": 13.0}
   }
 }
 ```
 
-`percentages` is new — a personality-test-style breakdown across every snack, not just the winner.
-Purely additive; existing code reading `payload.snack` still works.
+`snacks` is a LIST now, not a single `snack` string — a guest can genuinely match more than one (up
+to all of them), decided by Tubi, not a fixed rule. `percentages` is new too — an independent 0-100
+confidence score per snack, NOT a split of 100 across all snacks (two snacks can both score high at
+once). Both are additive changes to the `display` message shape; nothing else about it changed.
 
 ## Not changed
 

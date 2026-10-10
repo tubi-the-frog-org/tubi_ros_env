@@ -33,3 +33,28 @@ Pi uses native ROS 2 Jazzy packages (not this Docker image) — see Step 0 in
 - `animatronic_ws/` — the Pi-side ROS 2 workspace (this task's scope).
 - `esp32_firmware/` — PlatformIO project for the ESP32 (servos, later audio
   playback). Out of scope here; see `esp32_firmware/README.md`.
+
+## Risks and recommendations (living list, updated as packages are built)
+
+- **Hotspot dependence.** The Pi's only internet is a phone hotspot that can
+  drop. The cloud LLM provider (brain) and the cloud TTS provider (speech)
+  both need it; `keyword`/`fallback` plus pre-generated audio must keep
+  working with zero network, within the configured timeout, so a dropped
+  hotspot degrades the experience rather than hanging it.
+- **Cloud API cost.** Both the brain's cloud LLM calls and speech's TTS
+  calls cost money per request/character and this is a publicly reachable
+  web endpoint. Mitigated by `cloud_daily_request_cap`/`cloud_total_request_cap`
+  + the `cloud_enabled` kill switch (brain), and a per-day character cap
+  (speech, not yet built) — but caps need setting to real values before
+  this goes live publicly, not just left at defaults.
+- **Key security.** `LLM_API_KEY`, `TTS_API_KEY`, `WEB_BRIDGE_TOKEN` come
+  from env/`secrets.env` only (see `secrets.env.example`), never a ROS
+  param (params are introspectable at runtime) and never logged above
+  DEBUG. The browser (speech-to-text only) never receives or holds any of
+  these.
+- **Prompt injection.** The guest's spoken text reaches the cloud LLM as
+  untrusted input. The system prompt explicitly frames it as data, not
+  instructions, and the structured-output schema + reply validation (snack
+  must be a real enum value, reply must mention that snack, no URLs, length
+  capped) bound what a successful injection could even produce — worst case
+  is a rejected response that falls through to the next provider.

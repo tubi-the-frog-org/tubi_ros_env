@@ -96,10 +96,3 @@ def test_warm_up_true_on_success():
 def test_warm_up_false_on_failure_does_not_raise():
     client = OllamaClient(base_url="http://127.0.0.1:1", model="qwen2.5:0.5b", timeout_s=2)
     assert client.warm_up(SNACK_IDS, "pick a snack") is False
-
-
-def test_generate_prose_reply_returns_stripped_content():
-    with FakeOllamaServer(chat_content="  A dramatic wizardly line!  ") as server:
-        client = OllamaClient(base_url=server.url, model="qwen2.5:0.5b", timeout_s=5)
-        text = client.generate_prose_reply("hello", COOKIES)
-        assert text == "A dramatic wizardly line!"

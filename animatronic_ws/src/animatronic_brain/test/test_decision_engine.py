@@ -1,11 +1,13 @@
 from animatronic_common.snacks import Line, Snack, SnacksConfig
-from animatronic_brain.decision_engine import (
+from animatronic_brain.decision_engine import DecisionEngine
+from animatronic_brain.llm_provider import (
+    SOURCE_CLOUD,
     SOURCE_FALLBACK,
     SOURCE_KEYWORD,
-    SOURCE_LLM,
-    DecisionEngine,
+    FallbackProvider,
+    KeywordProvider,
+    ProviderDecision,
 )
-from animatronic_brain.ollama_client import OllamaError
 
 COOKIES = Snack(id="cookies", label="Cookies", slot=1, angle=65,
                  aliases=["biscuit"], tags=["sweet", "soft"],
@@ -19,102 +21,82 @@ NONE = Snack(id="none", label="No snack", slot=0, angle=0, aliases=[], tags=[],
 SNACKS = SnacksConfig(version=1, default_snack="none", snacks=[COOKIES, CHIPS, NONE])
 
 
-class StubOllamaClient:
-    def __init__(self, choose_result=None, choose_exception=None, prose_result=None, prose_exception=None):
-        self.choose_result = choose_result
-        self.choose_exception = choose_exception
-        self.prose_result = prose_result
-        self.prose_exception = prose_exception
-        self.choose_calls = []
-        self.prose_calls = []
+class StubProvider:
+    """A provider that returns a fixed decision (or None) and records
+    whether it was consulted, for asserting short-circuit behavior."""
 
-    def choose_snack(self, user_text, snack_ids, system_prompt):
-        self.choose_calls.append(user_text)
-        if self.choose_exception:
-            raise self.choose_exception
-        return self.choose_result
+    def __init__(self, name, result):
+        self.name = name
+        self._result = result
+        self.called = False
 
-    def generate_prose_reply(self, user_text, snack, num_predict=None):
-        self.prose_calls.append(user_text)
-        if self.prose_exception:
-            raise self.prose_exception
-        return self.prose_result
+    def decide(self, request_id, raw_text, snacks):
+        self.called = True
+        return self._result
 
 
-def test_keyword_match_short_circuits_ollama():
-    client = StubOllamaClient()
-    engine = DecisionEngine(client, keyword_threshold=1, keyword_margin=1)
+def test_first_provider_to_decide_wins_and_short_circuits():
+    first = StubProvider("keyword", ProviderDecision(snack_id="chips", source=SOURCE_KEYWORD, reply_text=None))
+    second = StubProvider("cloud", ProviderDecision(snack_id="cookies", source=SOURCE_CLOUD, reply_text="nope"))
+    engine = DecisionEngine([first, second])
 
-    decision = engine.decide("req-1", "something crunchy and salty please", SNACKS)
+    decision = engine.decide("req-1", "anything", SNACKS)
 
     assert decision.snack_id == "chips"
     assert decision.source == SOURCE_KEYWORD
     assert decision.text == "chips!"
-    assert client.choose_calls == []  # never fell through to the LLM
+    assert second.called is False
 
 
-def test_llm_path_used_when_no_keyword_match():
-    client = StubOllamaClient(choose_result="cookies")
-    engine = DecisionEngine(client, keyword_threshold=1, keyword_margin=1)
+def test_falls_through_providers_that_defer():
+    deferring = StubProvider("keyword", None)
+    deciding = StubProvider("cloud", ProviderDecision(snack_id="cookies", source=SOURCE_CLOUD, reply_text="A cookie omen!"))
+    engine = DecisionEngine([deferring, deciding])
 
-    decision = engine.decide("req-2", "I feel like rain today", SNACKS)
+    decision = engine.decide("req-2", "anything", SNACKS)
 
     assert decision.snack_id == "cookies"
-    assert decision.source == SOURCE_LLM
+    assert decision.source == SOURCE_CLOUD
+    assert decision.text == "A cookie omen!"
+    assert decision.line_id == "cloud_generated"
+
+
+def test_reply_text_none_falls_back_to_pregenerated_line_with_templating():
+    provider = StubProvider("keyword", ProviderDecision(snack_id="cookies", source=SOURCE_KEYWORD, reply_text=None))
+    engine = DecisionEngine([provider])
+
+    decision = engine.decide("req-3", "I feel like rain today", SNACKS)
+
     assert decision.text == "cookies for I feel like rain today!"
-    assert client.choose_calls == ["I feel like rain today"]
+    assert decision.line_id == "cookies_1"
 
 
-def test_fallback_path_used_on_ollama_error():
-    client = StubOllamaClient(choose_exception=OllamaError("boom"))
-    engine = DecisionEngine(client, keyword_threshold=1, keyword_margin=1)
+def test_empty_chain_hard_falls_back_without_crashing():
+    engine = DecisionEngine([])
 
-    decision = engine.decide("req-3", "totally unrelated text", SNACKS)
+    decision = engine.decide("req-4", "anything", SNACKS)
 
     assert decision.snack_id == "none"
     assert decision.source == SOURCE_FALLBACK
     assert decision.text == "nothing for you."
 
 
-def test_llm_reply_true_uses_generated_prose_on_llm_path():
-    client = StubOllamaClient(choose_result="cookies", prose_result="A dramatic cookie announcement!")
-    engine = DecisionEngine(client, keyword_threshold=1, keyword_margin=1, llm_reply=True)
+def test_chain_of_all_deferring_providers_hard_falls_back():
+    engine = DecisionEngine([StubProvider("keyword", None), StubProvider("cloud", None)])
 
-    decision = engine.decide("req-4", "I feel like rain today", SNACKS)
+    decision = engine.decide("req-5", "anything", SNACKS)
 
-    assert decision.source == SOURCE_LLM
-    assert decision.text == "A dramatic cookie announcement!"
-    assert decision.line_id == "llm_generated"
-    assert client.prose_calls == ["I feel like rain today"]
-
-
-def test_llm_reply_true_falls_back_to_pregenerated_line_on_prose_failure():
-    client = StubOllamaClient(choose_result="cookies", prose_exception=OllamaError("boom"))
-    engine = DecisionEngine(client, keyword_threshold=1, keyword_margin=1, llm_reply=True)
-
-    decision = engine.decide("req-5", "I feel like rain today", SNACKS)
-
-    assert decision.source == SOURCE_LLM
-    assert decision.line_id == "cookies_1"
-    assert "I feel like rain today" in decision.text
-
-
-def test_llm_reply_true_has_no_effect_on_keyword_path():
-    client = StubOllamaClient()
-    engine = DecisionEngine(client, keyword_threshold=1, keyword_margin=1, llm_reply=True)
-
-    decision = engine.decide("req-6", "something crunchy and salty please", SNACKS)
-
-    assert decision.source == SOURCE_KEYWORD
-    assert decision.text == "chips!"
-    assert client.prose_calls == []
-
-
-def test_fallback_path_does_not_consult_llm_reply():
-    client = StubOllamaClient(choose_exception=OllamaError("boom"))
-    engine = DecisionEngine(client, keyword_threshold=1, keyword_margin=1, llm_reply=True)
-
-    decision = engine.decide("req-7", "totally unrelated text", SNACKS)
-
+    assert decision.snack_id == "none"
     assert decision.source == SOURCE_FALLBACK
-    assert client.prose_calls == []
+
+
+def test_real_keyword_and_fallback_providers_end_to_end():
+    engine = DecisionEngine([KeywordProvider(threshold=1, margin=1), FallbackProvider()])
+
+    keyword_hit = engine.decide("req-6", "something crunchy and salty", SNACKS)
+    assert keyword_hit.source == SOURCE_KEYWORD
+    assert keyword_hit.snack_id == "chips"
+
+    no_match = engine.decide("req-7", "totally unrelated text", SNACKS)
+    assert no_match.source == SOURCE_FALLBACK
+    assert no_match.snack_id == "none"

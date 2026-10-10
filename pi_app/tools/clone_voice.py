@@ -54,7 +54,12 @@ def main():
     print(f"cloning a voice named '{args.name}' from {args.audio}...", file=sys.stderr)
     with open(args.audio, "rb") as f:
         try:
-            result = client.voices.ivc.create(name=args.name, files=[f])
+            # labels={} is required, not just optional -- this SDK version
+            # (elevenlabs 2.71.0) has a bug where omitting `labels` (or
+            # passing None) fails server-side with "Labels must be
+            # serialized dictionary object" instead of being treated as
+            # absent. Verified: an explicit empty dict works.
+            result = client.voices.ivc.create(name=args.name, files=[f], labels={})
         except Exception as e:  # noqa: BLE001 -- one-off CLI tool, surface whatever the SDK raises clearly
             print(f"error: voice cloning failed: {e}", file=sys.stderr)
             raise SystemExit(1)

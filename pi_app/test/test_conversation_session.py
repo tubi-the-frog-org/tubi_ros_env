@@ -23,11 +23,16 @@ class StubDecisionClient:
 
 
 def _not_done(reply="Tell me about yourself!"):
-    return ConversationTurn(reply_text=reply, done=False, snack_id=None, percentages=None)
+    return ConversationTurn(reply_text=reply, done=False, snack_ids=[], percentages=None)
 
 
-def _done(snack_id="chips", reply="Chips await!", percentages=None):
-    return ConversationTurn(reply_text=reply, done=True, snack_id=snack_id, percentages=percentages or {"cookies": 25.0, "chips": 75.0})
+def _done(snack_ids=("chips",), reply="Chips await!", percentages=None):
+    return ConversationTurn(
+        reply_text=reply,
+        done=True,
+        snack_ids=list(snack_ids),
+        percentages=percentages or {"cookies": 25.0, "chips": 75.0},
+    )
 
 
 def test_start_returns_first_reply_and_is_not_done():
@@ -56,7 +61,7 @@ def test_respond_accumulates_history_across_turns():
 def test_respond_reaching_done_sets_result():
     client = StubDecisionClient([
         _not_done("Hi there!"),
-        _done(snack_id="chips", reply="Chips for you!", percentages={"cookies": 10.0, "chips": 90.0}),
+        _done(snack_ids=("chips",), reply="Chips for you!", percentages={"cookies": 10.0, "chips": 90.0}),
     ])
     session = ConversationSession("s1", client, SNACKS)
     session.start()
@@ -65,11 +70,26 @@ def test_respond_reaching_done_sets_result():
     assert reply == "Chips for you!"
     assert session.done is True
     assert isinstance(session.result, QuizResult)
-    assert session.result.chosen_snack_id == "chips"
-    assert session.result.slot == 3
+    assert len(session.result.chosen_snacks) == 1
+    assert session.result.chosen_snacks[0].id == "chips"
+    assert session.result.chosen_snacks[0].slot == 3
+    assert session.result.chosen_snacks[0].label == "Chips"
     assert session.result.percentages == {"cookies": 10.0, "chips": 90.0}
     assert session.result.transcript[0] == {"role": "user", "content": "(The guest has just arrived and hasn't said anything yet. Begin: introduce yourself with your usual mixed-up backstory, then ask them to introduce themselves.)"}
     assert all(m["role"] != "system" for m in session.result.transcript)
+
+
+def test_respond_reaching_done_can_choose_multiple_snacks():
+    client = StubDecisionClient([
+        _not_done("Hi there!"),
+        _done(snack_ids=("cookies", "chips"), reply="Both cookies and chips suit you!", percentages={"cookies": 70.0, "chips": 65.0}),
+    ])
+    session = ConversationSession("s1", client, SNACKS)
+    session.start()
+    session.respond("yes, reveal it")
+
+    assert [s.id for s in session.result.chosen_snacks] == ["cookies", "chips"]
+    assert session.result.percentages == {"cookies": 70.0, "chips": 65.0}
 
 
 def test_respond_after_done_raises():
@@ -153,14 +173,15 @@ def test_forced_reveal_that_still_fails_finalizes_locally_instead_of_looping():
     assert client.force_done_flags[-1] is True
     assert session.done is True
     assert isinstance(session.result, QuizResult)
-    assert session.result.chosen_snack_id == "chips"  # the only non-default choosable snack in SNACKS
+    assert len(session.result.chosen_snacks) == 1
+    assert session.result.chosen_snacks[0].id == "chips"  # the only non-default choosable snack in SNACKS
     assert session.result.percentages == {"chips": 100.0}
     assert "chips" in reply.lower()
 
 
 def test_force_done_turn_that_comes_back_done_finalizes_normally():
     # +1 for start()'s own turn, which doesn't count toward the question limit
-    turns = [_not_done(f"Question {i}") for i in range(7)] + [_done(snack_id="chips")]
+    turns = [_not_done(f"Question {i}") for i in range(7)] + [_done(snack_ids=("chips",))]
     client = StubDecisionClient(turns)
     session = ConversationSession("s1", client, SNACKS)
     session.start()

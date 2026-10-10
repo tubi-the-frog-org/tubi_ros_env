@@ -62,11 +62,16 @@ class FakeWs:
 
 
 def _not_done(reply="Tell me about yourself!"):
-    return ConversationTurn(reply_text=reply, done=False, snack_id=None, percentages=None)
+    return ConversationTurn(reply_text=reply, done=False, snack_ids=[], percentages=None)
 
 
-def _done(snack_id="chips", reply="Chips await!", percentages=None):
-    return ConversationTurn(reply_text=reply, done=True, snack_id=snack_id, percentages=percentages or {"cookies": 25.0, "chips": 75.0})
+def _done(snack_ids=("chips",), reply="Chips await!", percentages=None):
+    return ConversationTurn(
+        reply_text=reply,
+        done=True,
+        snack_ids=list(snack_ids),
+        percentages=percentages or {"cookies": 25.0, "chips": 75.0},
+    )
 
 
 def _write_snacks(tmp_path):
@@ -145,7 +150,7 @@ async def test_reveal_sends_display_with_percentages_plays_audio_and_dispenses(s
     result_path = tmp_path / "result.json"
     client, decision_client = _client(
         snacks_store,
-        [_not_done("Hi!"), _done(snack_id="chips", reply="Chips await!", percentages={"chips": 80.0, "none": 20.0})],
+        [_not_done("Hi!"), _done(snack_ids=("chips",), reply="Chips await!", percentages={"chips": 80.0, "none": 20.0})],
         result_path,
     )
     ws = FakeWs()
@@ -154,12 +159,28 @@ async def test_reveal_sends_display_with_percentages_plays_audio_and_dispenses(s
     await client.handle_message(ws, json.dumps({"type": "transcript", "payload": {"text": "yes reveal it"}}))
 
     display_msgs = [m for m in ws.sent if m["type"] == "display"]
-    assert display_msgs == [{"type": "display", "payload": {"kind": "result", "snack": "Chips", "percentages": {"chips": 80.0, "none": 20.0}}}]
+    assert display_msgs == [{"type": "display", "payload": {"kind": "result", "snacks": ["Chips"], "percentages": {"chips": 80.0, "none": 20.0}}}]
     assert client._esp32_link.opened == 1
     assert client._esp32_link.closed == 1
     assert client._audio_player.played == [b"mp3-bytes", b"mp3-bytes"]  # intro + reveal
     assert client._session is None  # cleared after reveal
-    assert json.loads(result_path.read_text())["chosen_snack_id"] == "chips"
+    saved = json.loads(result_path.read_text())
+    assert [s["id"] for s in saved["chosen_snacks"]] == ["chips"]
+
+
+async def test_reveal_can_display_multiple_chosen_snacks(snacks_store, tmp_path):
+    client, decision_client = _client(
+        snacks_store,
+        [_not_done("Hi!"), _done(snack_ids=("chips", "none"), reply="Both chips and nothing suit you!", percentages={"chips": 70.0, "none": 65.0})],
+        tmp_path / "result.json",
+    )
+    ws = FakeWs()
+    await client.handle_message(ws, json.dumps({"type": "session:start", "payload": {}}))
+
+    await client.handle_message(ws, json.dumps({"type": "transcript", "payload": {"text": "yes reveal it"}}))
+
+    display_msgs = [m for m in ws.sent if m["type"] == "display"]
+    assert display_msgs[0]["payload"]["snacks"] == ["Chips", "No snack"]
 
 
 async def test_session_end_clears_session(snacks_store, tmp_path):

@@ -32,7 +32,6 @@ _MAX_REPLY_CHARS = 160
 # a truncation point, not a hard content rule, unlike _MAX_REPLY_CHARS.
 _MAX_CONVERSATION_REPLY_CHARS = 500
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
-_UNDECIDED = "undecided"
 
 # Short and fixed per snacks config (changes only on a snacks.json reload).
 # Explicitly tells the model to treat the guest's text as data, not
@@ -60,13 +59,21 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "questions, just ask the question, plainly and directly, with NO reaction to their last answer and no "
     "wise remark first. Most of your reply here should be ONLY the question itself, nothing else. Add a brief "
     "one-clause reaction ONLY if something they said truly calls for it -- that should be rare, not the norm.\n\n"
-    "Do not reveal a snack until the guest clearly confirms they're ready (e.g. \"yes\", \"go ahead\", \"show "
-    "me\"). Until then: set done=false, snack=\"{undecided}\", and leave percentages at 0 for every snack -- "
-    "those fields are ignored until done=true.\n\n"
-    "Once confirmed: set done=true, pick the single snack id that best matches the guest's overall vibe across "
-    "the whole conversation, set percentages for EVERY snack id to your own estimate (0-100) of how well it "
-    "matches the guest based on real assumptions from what they said -- not a random guess -- and write ONE "
-    "short mystical sentence that names the chosen snack."
+    "Do NOT ask permission to reveal, and do not wait for the guest to say \"yes\" or \"show me\" -- you are "
+    "reading their vibe like a close friend would, not running a quiz show waiting to be told to give the "
+    "answer. Reveal after the guest's 2nd or 3rd answer to a personality question -- NOT later than their 4th. "
+    "By then you already have enough to make a confident read; do not keep asking just to be extra sure. "
+    "Treat asking a 5th question as a mistake, not a safe default. While you still genuinely need more "
+    "information (which should be rare, and never past the 4th answer): set done=false, leave snacks as an "
+    "empty list, and leave percentages at 0 for every snack -- those fields are ignored until done=true.\n\n"
+    "When you reveal: set percentages for EVERY snack id to your own independent estimate (0-100) of how well "
+    "it matches the guest, based on real assumptions from what they said -- not a random guess. These are "
+    "independent confidence scores, not a split of 100 across all snacks, so more than one snack can "
+    "legitimately score high at once. Then set snacks to the list of every snack id whose score is genuinely "
+    "high enough to be a real match for this guest -- this can be just one snack, or it can be several (up to "
+    "all of them) if more than one truly fits. Do not default to only ever picking a single snack; if two or "
+    "three genuinely fit the guest, include all of them. Finally, write ONE short mystical sentence that names "
+    "the snack(s) you chose."
 )
 
 
@@ -104,22 +111,28 @@ def build_schema(snack_ids: list[str]) -> dict:
 
 def build_system_prompt(snacks: list[Snack]) -> str:
     snack_list = ", ".join(f"{s.id} ({s.label}; tags: {', '.join(s.tags) or 'none'})" for s in snacks)
-    return _SYSTEM_PROMPT_TEMPLATE.format(snack_list=snack_list, undecided=_UNDECIDED)
+    return _SYSTEM_PROMPT_TEMPLATE.format(snack_list=snack_list)
 
 
 def build_conversation_schema(snack_ids: list[str], force_done: bool = False) -> dict:
-    """force_done=True locks `done` to literally only accept true AND drops
-    "undecided" from `snack`'s enum, so the model is structurally required
-    to both stop stalling and commit to a real snack -- used as a last
-    resort once a conversation has run long (see ConversationSession's
-    question cap), since a prompt instruction alone wasn't reliably enough
-    to make the model wrap up (measured: it would say done=true but still
-    leave snack="undecided", since only `done` was locked)."""
+    """`snacks` is a list, not a single id -- the guest can match more than
+    one (see ConversationSession/the system prompt). An empty list means
+    "not revealing yet". force_done=True locks `done` to literally only
+    accept true, so the model is structurally required to stop stalling --
+    used as a last resort once a conversation has run long (see
+    ConversationSession's question cap), since a prompt instruction alone
+    wasn't reliably enough to make the model wrap up. It does NOT force
+    `snacks` to be non-empty -- that's still possible even then (handled by
+    ConversationSession's local-finalize fallback), since locking an array
+    to "non-empty" isn't expressible the same way a boolean enum is."""
     return {
         "type": "object",
         "properties": {
             "done": {"type": "boolean", "enum": [True]} if force_done else {"type": "boolean"},
-            "snack": {"type": "string", "enum": snack_ids if force_done else [*snack_ids, _UNDECIDED]},
+            "snacks": {
+                "type": "array",
+                "items": {"type": "string", "enum": snack_ids},
+            },
             "reply": {"type": "string"},
             "percentages": {
                 "type": "object",
@@ -128,7 +141,7 @@ def build_conversation_schema(snack_ids: list[str], force_done: bool = False) ->
                 "additionalProperties": False,
             },
         },
-        "required": ["done", "snack", "reply", "percentages"],
+        "required": ["done", "snacks", "reply", "percentages"],
         "additionalProperties": False,
     }
 
@@ -137,8 +150,8 @@ def build_conversation_schema(snack_ids: list[str], force_done: bool = False) ->
 class ConversationTurn:
     reply_text: str
     done: bool
-    snack_id: str | None  # only meaningful when done
-    percentages: dict[str, float] | None  # only meaningful when done, normalized to sum to 100
+    snack_ids: list[str]  # empty when not done; one or more (up to all) when done
+    percentages: dict[str, float] | None  # only meaningful when done -- independent 0-100 scores, not a split of 100
 
 
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
@@ -158,15 +171,28 @@ def _mentions_snack(reply: str, snack: Snack) -> bool:
     return any(_normalize_for_mention(name) in reply_norm for name in names if name)
 
 
+def _mentions_any_snack(reply: str, snacks: list[Snack]) -> bool:
+    return any(_mentions_snack(reply, s) for s in snacks)
+
+
 def validate_reply(reply: str, snack: Snack) -> None:
+    validate_reveal_reply(reply, [snack])
+
+
+def validate_reveal_reply(reply: str, chosen_snacks: list[Snack]) -> None:
+    """Same content rules as validate_reply, generalized to a reveal that
+    names one or more snacks: must mention AT LEAST ONE of them (requiring
+    every single one, when several are chosen, would make an already-short
+    "one sentence" reveal line fail far more easily for no real benefit)."""
     if not reply:
         raise DecisionValidationError("reply is empty")
     if len(reply) > _MAX_REPLY_CHARS:
         raise DecisionValidationError(f"reply exceeds {_MAX_REPLY_CHARS} chars")
     if _URL_RE.search(reply):
         raise DecisionValidationError("reply contains a URL")
-    if not _mentions_snack(reply, snack):
-        raise DecisionValidationError(f"reply does not mention snack '{snack.id}'")
+    if not _mentions_any_snack(reply, chosen_snacks):
+        ids = [s.id for s in chosen_snacks]
+        raise DecisionValidationError(f"reply does not mention any of {ids}")
 
 
 class DecisionClient:
@@ -288,12 +314,14 @@ class DecisionClient:
             content = body["choices"][0]["message"]["content"]
             parsed = json.loads(content)
             done = parsed["done"]
-            snack_id = parsed["snack"]
+            chosen_ids = parsed["snacks"]
             reply = parsed["reply"]
             raw_percentages = parsed["percentages"]
         except (ValueError, KeyError, IndexError, TypeError) as e:
             raise DecisionInvalidResponseError(f"could not parse conversation response: {e}") from e
 
+        if not isinstance(chosen_ids, list):
+            raise DecisionInvalidResponseError(f"'snacks' must be a list, got {type(chosen_ids).__name__}")
         if not reply:
             raise DecisionValidationError("reply is empty")
         if _URL_RE.search(reply):
@@ -306,32 +334,34 @@ class DecisionClient:
             # which tends to produce an even longer reply next time -- measured
             # this looping in practice with a real model).
             reply = _truncate_conversational_reply(reply)
-            return ConversationTurn(reply_text=reply, done=False, snack_id=None, percentages=None)
+            return ConversationTurn(reply_text=reply, done=False, snack_ids=[], percentages=None)
 
-        if snack_id not in snack_ids:
-            raise DecisionInvalidResponseError(f"done=true but snack '{snack_id}' is not in {snack_ids}")
-        snack = next(s for s in snacks if s.id == snack_id)
-        validate_reply(reply, snack)  # the <=160 char + mention check applies to the reveal line
+        if not chosen_ids:
+            raise DecisionInvalidResponseError("done=true but no snacks were chosen")
+        unknown = [sid for sid in chosen_ids if sid not in snack_ids]
+        if unknown:
+            raise DecisionInvalidResponseError(f"done=true with unknown snack id(s) {unknown}, not in {snack_ids}")
 
-        percentages = _normalize_percentages(raw_percentages, snack_ids)
-        return ConversationTurn(reply_text=reply, done=True, snack_id=snack_id, percentages=percentages)
+        chosen_snacks = [next(s for s in snacks if s.id == sid) for sid in chosen_ids]
+        validate_reveal_reply(reply, chosen_snacks)  # the <=160 char + must-mention-one check
+
+        percentages = _clamp_percentages(raw_percentages, snack_ids)
+        return ConversationTurn(reply_text=reply, done=True, snack_ids=chosen_ids, percentages=percentages)
 
 
-def _normalize_percentages(raw: object, snack_ids: list[str]) -> dict[str, float]:
-    """Defensive against a model's raw percentages not summing to 100 --
-    rescales them to, so "percentages" always means something
-    comparable regardless of how the model rounded internally."""
+def _clamp_percentages(raw: object, snack_ids: list[str]) -> dict[str, float]:
+    """Each snack's percentage is an INDEPENDENT confidence score (e.g. a
+    guest can legitimately be "70% m&ms and 70% pretzels" at once) -- these
+    are deliberately NOT rescaled to sum to 100 across snacks, unlike a
+    typical single-choice distribution. Just defends against a missing/
+    non-numeric value and clamps to the valid 0-100 range."""
     cleaned = {}
     for sid in snack_ids:
         value = raw.get(sid, 0) if isinstance(raw, dict) else 0
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             value = 0
-        cleaned[sid] = max(0.0, float(value))
-
-    total = sum(cleaned.values())
-    if total <= 0:
-        return {sid: 0.0 for sid in snack_ids}
-    return {sid: round(v / total * 100, 1) for sid, v in cleaned.items()}
+        cleaned[sid] = round(max(0.0, min(100.0, float(value))), 1)
+    return cleaned
 
 
 def _truncate_conversational_reply(reply: str, limit: int = _MAX_CONVERSATION_REPLY_CHARS) -> str:

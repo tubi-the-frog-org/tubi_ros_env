@@ -160,16 +160,19 @@ class TeammateClient:
             await ws.send_json({"type": "state", "payload": {"speaking": False}})
 
     async def _reveal(self, ws, result: QuizResult):
-        snack = self._snacks_store.current.get(result.chosen_snack_id)
-        snack_label = snack.label if snack else result.chosen_snack_id
         await ws.send_json({
             "type": "display",
-            "payload": {"kind": "result", "snack": snack_label, "percentages": result.percentages},
+            "payload": {
+                "kind": "result",
+                "snacks": [s.label for s in result.chosen_snacks],
+                "percentages": result.percentages,
+            },
         })
 
         # Only one physical mechanism exists right now (one trap door, no
         # per-slot routing -- see esp32_link.py), so every reveal just
-        # pulses it open then closed.
+        # pulses it open then closed once, regardless of how many snacks
+        # were chosen digitally (the firmware can't dispense more than one).
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._esp32_link.open_trap_door)
         await asyncio.sleep(self._dispense_open_seconds)

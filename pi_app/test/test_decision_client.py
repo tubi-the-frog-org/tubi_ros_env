@@ -152,66 +152,93 @@ def _history():
 
 def test_build_conversation_schema_shape():
     schema = build_conversation_schema(["cookies", "chips"])
-    assert schema["properties"]["snack"]["enum"] == ["cookies", "chips", "undecided"]
+    assert schema["properties"]["snacks"] == {"type": "array", "items": {"type": "string", "enum": ["cookies", "chips"]}}
     assert schema["properties"]["done"] == {"type": "boolean"}
     assert set(schema["properties"]["percentages"]["properties"]) == {"cookies", "chips"}
-    assert schema["required"] == ["done", "snack", "reply", "percentages"]
+    assert schema["required"] == ["done", "snacks", "reply", "percentages"]
 
 
-def test_build_conversation_schema_force_done_locks_done_and_drops_undecided():
+def test_build_conversation_schema_force_done_locks_done():
     schema = build_conversation_schema(["cookies", "chips"], force_done=True)
     assert schema["properties"]["done"] == {"type": "boolean", "enum": [True]}
-    assert schema["properties"]["snack"]["enum"] == ["cookies", "chips"]  # no "undecided"
+    assert schema["properties"]["snacks"]["items"]["enum"] == ["cookies", "chips"]
 
 
 def _not_done_content(reply="Greetings! Tell me about yourself."):
-    return json.dumps({"done": False, "snack": "undecided", "reply": reply, "percentages": {"cookies": 0, "chips": 0}})
+    return json.dumps({"done": False, "snacks": [], "reply": reply, "percentages": {"cookies": 0, "chips": 0}})
 
 
-def _done_content(snack="chips", reply="The crunchy chips await!", percentages=None):
+def _done_content(snacks=("chips",), reply="The crunchy chips await!", percentages=None):
     percentages = percentages if percentages is not None else {"cookies": 20, "chips": 80}
-    return json.dumps({"done": True, "snack": snack, "reply": reply, "percentages": percentages})
+    return json.dumps({"done": True, "snacks": list(snacks), "reply": reply, "percentages": percentages})
 
 
-def test_converse_not_done_returns_reply_without_snack_or_percentages():
+def test_converse_not_done_returns_reply_without_snacks_or_percentages():
     with FakeDecisionServer(responses=[{"status": 200, "content": _not_done_content()}]) as server:
         client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
         turn = client.converse(_history(), SNACKS)
         assert turn.done is False
         assert turn.reply_text == "Greetings! Tell me about yourself."
-        assert turn.snack_id is None
+        assert turn.snack_ids == []
         assert turn.percentages is None
 
 
-def test_converse_done_returns_snack_and_normalized_percentages():
-    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(percentages={"cookies": 20, "chips": 60})}]) as server:
+def test_converse_done_returns_clamped_independent_percentages():
+    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(percentages={"cookies": 20, "chips": 150})}]) as server:
         client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
         turn = client.converse(_history(), SNACKS)
         assert turn.done is True
-        assert turn.snack_id == "chips"
-        # 20/80 and 60/80 renormalized to sum to 100
-        assert turn.percentages == {"cookies": 25.0, "chips": 75.0}
+        assert turn.snack_ids == ["chips"]
+        # NOT rescaled to sum to 100 -- independent scores, just clamped to [0, 100]
+        assert turn.percentages == {"cookies": 20.0, "chips": 100.0}
 
 
-def test_converse_done_with_all_zero_percentages_does_not_divide_by_zero():
+def test_converse_done_can_choose_multiple_snacks():
+    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(
+        snacks=["cookies", "chips"], reply="Both cookies and chips call to you!",
+        percentages={"cookies": 70, "chips": 65},
+    )}]) as server:
+        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
+        turn = client.converse(_history(), SNACKS)
+        assert turn.snack_ids == ["cookies", "chips"]
+        assert turn.percentages == {"cookies": 70.0, "chips": 65.0}
+
+
+def test_converse_done_with_all_zero_percentages():
     with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(percentages={"cookies": 0, "chips": 0})}]) as server:
         client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
         turn = client.converse(_history(), SNACKS)
         assert turn.percentages == {"cookies": 0.0, "chips": 0.0}
 
 
-def test_converse_done_invalid_snack_raises():
-    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(snack="not_a_snack")}]) as server:
+def test_converse_done_no_snacks_chosen_raises():
+    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(snacks=[])}]) as server:
         client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
         with pytest.raises(DecisionInvalidResponseError):
             client.converse(_history(), SNACKS)
 
 
-def test_converse_done_reply_not_mentioning_snack_raises():
+def test_converse_done_invalid_snack_raises():
+    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(snacks=["not_a_snack"])}]) as server:
+        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
+        with pytest.raises(DecisionInvalidResponseError):
+            client.converse(_history(), SNACKS)
+
+
+def test_converse_done_reply_not_mentioning_any_chosen_snack_raises():
     with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(reply="A vague mystical thing.")}]) as server:
         client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
         with pytest.raises(DecisionValidationError):
             client.converse(_history(), SNACKS)
+
+
+def test_converse_done_reply_mentioning_just_one_of_several_chosen_snacks_is_ok():
+    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(
+        snacks=["cookies", "chips"], reply="Chips await you, traveler!",
+    )}]) as server:
+        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
+        turn = client.converse(_history(), SNACKS)
+        assert turn.snack_ids == ["cookies", "chips"]
 
 
 def test_converse_not_done_overlong_reply_is_truncated_not_discarded():

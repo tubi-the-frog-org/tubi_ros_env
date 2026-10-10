@@ -1,16 +1,22 @@
 """One guest's multi-turn conversation with Tubi: intro -> guest's own
-intro -> open-ended questions -> confirmation -> reveal with
-percentages. The LLM itself drives the flow (what to ask, when enough
-is known, when to reveal) via DecisionClient.converse() -- this class
-just owns the growing chat history and turns the final answer into a
-JSON-able QuizResult.
+intro -> open-ended questions -> reveal with percentages, once Tubi is
+confident (no "are you ready?" gate -- he decides on his own, like a
+friend reading someone's vibe rather than a quiz show waiting to be
+told to give the answer). The LLM itself drives the flow (what to ask,
+when it's confident enough, which snack(s) fit) via
+DecisionClient.converse() -- this class just owns the growing chat
+history and turns the final answer into a JSON-able QuizResult. A
+guest can match more than one snack -- the reveal can name anywhere
+from one up to all of them.
 
 Percentages are the model's own holistic read of the whole
 conversation, not a mechanical point tally -- in the spirit of the
 IFT/EmoMap research this was asked to follow (open-ended elicitation
 rather than forcing answers onto a fixed predetermined scale), though
 it's worth being honest that an LLM's holistic judgment call is not
-the same rigor as a validated psychometric instrument.
+the same rigor as a validated psychometric instrument. Each snack's
+percentage is independent (not a split of 100 across all snacks), since
+a guest can genuinely score high on more than one at once.
 """
 
 from __future__ import annotations
@@ -48,18 +54,24 @@ _START_PROMPT = (
 _NUDGE_AFTER_TURNS = 4
 _FORCE_AFTER_TURNS = 6
 _WRAP_UP_NUDGE = (
-    "(Internal note, not from the guest -- you've asked enough questions now. Do not ask any more personality "
-    "questions. If the guest hasn't confirmed they're ready yet, ask clearly if they'd like their result now. "
-    "If they already confirmed, you MUST set done=true this turn and reveal.)"
+    "(Internal note, not from the guest -- you've asked enough questions now. You have enough information to "
+    "decide. Do not ask any more questions -- set done=true this turn, choose whichever snack(s) genuinely "
+    "fit, and reveal.)"
 )
+
+
+@dataclass(frozen=True)
+class ChosenSnack:
+    id: str
+    slot: int
+    label: str
 
 
 @dataclass(frozen=True)
 class QuizResult:
     session_id: str
-    chosen_snack_id: str
-    slot: int
-    percentages: dict[str, float]
+    chosen_snacks: list[ChosenSnack]  # one or more, up to all configured snacks
+    percentages: dict[str, float]  # independent 0-100 confidence per snack id, not a split of 100
     transcript: list[dict]  # [{"role": "user"|"assistant", "content": ...}, ...], no system prompt
 
 
@@ -133,11 +145,10 @@ class ConversationSession:
 
         if turn.done:
             self.done = True
-            snack = self._snacks.get(turn.snack_id)
+            chosen = [self._snacks.get(sid) for sid in turn.snack_ids]
             self.result = QuizResult(
                 session_id=self.session_id,
-                chosen_snack_id=snack.id,
-                slot=snack.slot,
+                chosen_snacks=[ChosenSnack(id=s.id, slot=s.slot, label=s.label) for s in chosen],
                 percentages=turn.percentages or {},
                 transcript=[m for m in self._messages if m["role"] != "system"],
             )
@@ -145,17 +156,18 @@ class ConversationSession:
         return turn.reply_text
 
     def _finalize_locally(self) -> str:
-        """Last-resort termination, no further LLM call: pick a snack
+        """Last-resort termination, no further LLM call: pick one snack
         ourselves (random, since we have no real signal the model failed
         to give us) and finish the session. Guarantees a demo never hangs
-        on an uncooperative model."""
+        on an uncooperative model. Deliberately picks just one here (not
+        the full multi-snack feature) -- this is the degenerate error path,
+        not worth the extra complexity."""
         snack = random.choice(self._choosable_snacks)
         self.done = True
         even_share = round(100.0 / len(self._choosable_snacks), 1)
         self.result = QuizResult(
             session_id=self.session_id,
-            chosen_snack_id=snack.id,
-            slot=snack.slot,
+            chosen_snacks=[ChosenSnack(id=snack.id, slot=snack.slot, label=snack.label)],
             percentages={s.id: even_share for s in self._choosable_snacks},
             transcript=[m for m in self._messages if m["role"] != "system"],
         )

@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from pi_app.snacks import Line, Snack
@@ -7,6 +9,7 @@ from pi_app.decision_client import (
     DecisionRequestError,
     DecisionTimeoutError,
     DecisionValidationError,
+    build_conversation_schema,
     build_schema,
     build_system_prompt,
     validate_reply,
@@ -129,3 +132,90 @@ def test_connection_refused_raises():
     client = DecisionClient(base_url="http://127.0.0.1:1", model="gpt-5-nano", api_key="sk-test", timeout_s=2)
     with pytest.raises(DecisionRequestError):
         client.choose_snack_and_reply("hello", SNACKS)
+
+
+# ---- converse() ----
+
+def _history():
+    return [
+        {"role": "system", "content": build_system_prompt(SNACKS)},
+        {"role": "user", "content": "(session start)"},
+    ]
+
+
+def test_build_conversation_schema_shape():
+    schema = build_conversation_schema(["cookies", "chips"])
+    assert schema["properties"]["snack"]["enum"] == ["cookies", "chips", "undecided"]
+    assert set(schema["properties"]["percentages"]["properties"]) == {"cookies", "chips"}
+    assert schema["required"] == ["done", "snack", "reply", "percentages"]
+
+
+def _not_done_content(reply="Greetings! Tell me about yourself."):
+    return json.dumps({"done": False, "snack": "undecided", "reply": reply, "percentages": {"cookies": 0, "chips": 0}})
+
+
+def _done_content(snack="chips", reply="The crunchy chips await!", percentages=None):
+    percentages = percentages if percentages is not None else {"cookies": 20, "chips": 80}
+    return json.dumps({"done": True, "snack": snack, "reply": reply, "percentages": percentages})
+
+
+def test_converse_not_done_returns_reply_without_snack_or_percentages():
+    with FakeDecisionServer(responses=[{"status": 200, "content": _not_done_content()}]) as server:
+        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
+        turn = client.converse(_history(), SNACKS)
+        assert turn.done is False
+        assert turn.reply_text == "Greetings! Tell me about yourself."
+        assert turn.snack_id is None
+        assert turn.percentages is None
+
+
+def test_converse_done_returns_snack_and_normalized_percentages():
+    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(percentages={"cookies": 20, "chips": 60})}]) as server:
+        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
+        turn = client.converse(_history(), SNACKS)
+        assert turn.done is True
+        assert turn.snack_id == "chips"
+        # 20/80 and 60/80 renormalized to sum to 100
+        assert turn.percentages == {"cookies": 25.0, "chips": 75.0}
+
+
+def test_converse_done_with_all_zero_percentages_does_not_divide_by_zero():
+    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(percentages={"cookies": 0, "chips": 0})}]) as server:
+        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
+        turn = client.converse(_history(), SNACKS)
+        assert turn.percentages == {"cookies": 0.0, "chips": 0.0}
+
+
+def test_converse_done_invalid_snack_raises():
+    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(snack="not_a_snack")}]) as server:
+        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
+        with pytest.raises(DecisionInvalidResponseError):
+            client.converse(_history(), SNACKS)
+
+
+def test_converse_done_reply_not_mentioning_snack_raises():
+    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(reply="A vague mystical thing.")}]) as server:
+        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
+        with pytest.raises(DecisionValidationError):
+            client.converse(_history(), SNACKS)
+
+
+def test_converse_not_done_long_reply_raises():
+    with FakeDecisionServer(responses=[{"status": 200, "content": _not_done_content(reply="x" * 400)}]) as server:
+        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
+        with pytest.raises(DecisionValidationError):
+            client.converse(_history(), SNACKS)
+
+
+def test_converse_empty_reply_raises():
+    with FakeDecisionServer(responses=[{"status": 200, "content": _not_done_content(reply="")}]) as server:
+        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
+        with pytest.raises(DecisionValidationError):
+            client.converse(_history(), SNACKS)
+
+
+def test_converse_bad_json_content_raises():
+    with FakeDecisionServer(responses=[{"status": 200, "content": "not json"}]) as server:
+        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
+        with pytest.raises(DecisionInvalidResponseError):
+            client.converse(_history(), SNACKS)

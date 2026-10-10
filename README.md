@@ -20,10 +20,28 @@ python3 -m venv .venv
 
 ## Testing without the website or the ESP32
 
+Secrets load automatically from `pi_app/secrets.env` (copy `secrets.env.example`
+and fill in real keys) — no need to `export` them by hand.
+
+**Have the actual conversation, by voice, using your own mic:**
+
 ```sh
 cd pi_app
-export LLM_API_KEY=...     # OpenAI-compatible
-export TTS_API_KEY=...     # ElevenLabs
+.venv/bin/pip install -r tools/requirements-mic.txt   # one-time; not in requirements.txt
+.venv/bin/python -m tools.talk_to_tubi
+```
+
+This is the real multi-turn flow (intro, questions, confirmation, reveal with
+percentages) running entirely locally — speech-to-text is a local Whisper
+model, not a cloud call, so only the decision+TTS calls cost anything. First
+run will trigger a macOS microphone-permission prompt for your terminal app;
+you'll need to approve that yourself. The final result is printed and saved to
+`tools/quiz_result.json`.
+
+**Or test just one question/answer pair (no mic, no conversation state):**
+
+```sh
+cd pi_app
 .venv/bin/python -m tools.try_request --text "something crunchy and salty"
 ```
 
@@ -43,11 +61,14 @@ export ESP32_SERIAL_PORT=/dev/ttyUSB0       # omit to run with no ESP32 attached
 .venv/bin/python -m pi_app.teammate_client
 ```
 
-This connects out to the website's WebSocket as "the teammate system," reacts
-to transcripts, and drives the ESP32/speaker. It does not host the website or
-the ESP32 firmware — both are teammates' code, in `website/` and
-`esp32_firmware/` respectively; see `CLAUDE.md`'s History section for what's
-actually in each.
+This connects out to the website's WebSocket as "the teammate system," drives
+the real multi-turn conversation per guest session, and drives the
+ESP32/speaker. It does not host the website or the ESP32 firmware — both are
+teammates' code, in `website/` and `esp32_firmware/` respectively; see
+`CLAUDE.md`'s History section for what's actually in each. The website's
+current contract doesn't yet support multi-turn (see
+`pi_app/docs/multi_turn_contract_proposal.md`) — use `tools/talk_to_tubi.py`
+above to test the real conversation until that's built.
 
 ## Swapping snacks
 

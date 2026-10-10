@@ -1,0 +1,7 @@
+# Only for tools/talk_to_tubi.py -- an interactive local test harness
+# using your Mac's own microphone. NOT part of the Pi deployment
+# (whisper pulls in torch, which has no business running on a Pi 3).
+# Install into pi_app's venv: .venv/bin/pip install -r tools/requirements-mic.txt
+SpeechRecognition>=3.10
+pyaudio>=0.2.14
+openai-whisper>=20231117

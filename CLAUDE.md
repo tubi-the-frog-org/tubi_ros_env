@@ -36,6 +36,18 @@ code/decisions that look like they contradict each other:
      `POST /speak` server) was wrong and was replaced by `teammate_client.py` (an outbound WS client).
    - TTS moved from OpenAI's `/audio/speech` to ElevenLabs, per a direct ask, as a stepping stone toward a
      cloned custom voice later (ElevenLabs supports voice cloning; OpenAI's TTS voices don't).
+5. **Replaced the one-shot "text in, snack+reply out" shape with a real multi-turn conversation.** Tubi now
+   introduces himself (with a running joke: he always gets one detail of his own backstory comically wrong),
+   asks the guest to introduce themselves, asks a few open-ended personality/feeling questions of his own
+   choosing, waits for an explicit confirmation, then reveals a snack with a personality-test-style percentage
+   breakdown across every snack — not just the winner. One endpoint, one schema, grown to support this: the
+   `{"snack","reply"}` schema gained `done` (keep talking vs. reveal now) and `percentages`, since a single
+   call can no longer always commit to a snack. `conversation_session.py` owns the growing chat history;
+   `DecisionClient.converse()` is the call. `website/docs/message-contract.md` only documents the old one-shot
+   shape, so `teammate_client.py` now sends a `speak` message per turn and an extended `display` — see
+   `pi_app/docs/multi_turn_contract_proposal.md` for exactly what the website side needs to add to really drive
+   this (not yet built there). `tools/talk_to_tubi.py` exercises the whole conversation locally, by voice, using
+   the dev machine's own microphone + local Whisper STT — no website, ESP32, or Pi needed to test it.
 
 ## Measured facts about the Pi (do not assume otherwise)
 - Raspberry Pi 3, 905 MiB RAM, aarch64, Raspberry Pi OS (Debian trixie), hostname `max`, user `maxwelllokshin`,
@@ -52,23 +64,23 @@ guest's phone browser (website/, a teammate's — mic + Web Speech API STT)
         |  WebSocket: {"type":"transcript","payload":{"text":...}}, broadcast to all clients
         v
 pi_app/teammate_client.py -- connects OUT to the website's WS hub as "the teammate system"
-        |
+        |  session:start -> new ConversationSession; transcript -> .respond(); session:end -> clear
         v
-DecisionService (pi_app/decision_service.py):
-  1. RequestBudget check (daily/total cap on decision calls)
-  2. DecisionClient -> one OpenAI-compatible /chat/completions call,
-     structured output {"snack": enum, "reply": string}
-  3. CharacterBudget check (daily/total cap on TTS characters)
-  4. TtsClient -> a SEPARATE ElevenLabs /text-to-speech/{voice_id} call -> mp3 bytes
-  -> SnackMessage(request_id, snack_id, slot, reply_text, audio_mp3, source)
+ConversationSession (pi_app/conversation_session.py), one per guest, owns the growing chat history:
+  per turn -> RequestBudget check -> DecisionClient.converse(history, snacks)
+              -> {"done": bool, "snack": enum|"undecided", "reply": string, "percentages": {...}}
+  every turn -> CharacterBudget check -> TtsClient.synthesize(reply) -> mp3 bytes (ElevenLabs)
         |
-        +--> ws.send_json({"type":"display",...}) / {"type":"state","payload":{"speaking":...}} back to the website
-        +--> AudioPlayer.play(audio_mp3) -- out of a speaker wired to the Pi itself (NOT the ESP32)
-        +--> EspLink.open_trap_door() / close_trap_door() -- single ASCII byte over serial to the ESP32
+        +--> every turn: ws.send_json({"type":"speak","payload":{"text":reply}}),
+        |    {"type":"state","payload":{"speaking":...}}, AudioPlayer.play(audio) on the Pi's own speaker
+        +--> only on done=true: {"type":"display","payload":{"kind":"result","snack":...,"percentages":{...}}},
+             EspLink.open_trap_door()/close_trap_door() (single ASCII byte over serial), write the
+             QuizResult JSON to tools/quiz_result.json
 ```
 The guest-facing frontend lives entirely in `website/` (a teammate's). The HTTPS-for-mic-access requirement and
 the website's own hosting choice are that teammate's call per `website/CLAUDE.md` — read it before assuming
-anything about where/how the site runs.
+anything about where/how the site runs. The `speak` message and `display`'s `percentages` field are a proposal
+(`pi_app/docs/multi_turn_contract_proposal.md`), not yet implemented on the website side.
 
 ### Why two cloud calls, not one combined audio+decision call
 Audio-output chat models' structured-output support is unverified/historically limited, and even where
@@ -115,35 +127,52 @@ Schema (validate on load with clear errors):
   beyond the stdlib.
 - `request_budget.py` — `RequestBudget` (decision calls) and `CharacterBudget` (TTS characters). Both have a
   daily cap and a lifetime cap; `-1` means unlimited.
-- `decision_client.py` — `DecisionClient.choose_snack_and_reply(text, snacks) -> (snack_id, reply)`. Structured
-  output, 15 s timeout, one retry only on 429/5xx (`temperature` is omitted by default -- `gpt-5-nano` 400s on
-  anything but its default of 1; pass one explicitly only for a model that supports it). Validates the reply
-  (non-empty, <=160 chars, no URL, mentions the chosen snack) — any failure raises `DecisionError`, which
-  `DecisionService` treats as "use the default snack and a hardcoded apology line," never as something that
-  reaches the guest as an error. System prompt explicitly frames the guest's text as DATA, never instructions
-  (prompt-injection defense). **Measured with real keys**: a `gpt-5-nano` structured-output call took ~11 s
-  end to end (hence the 15 s timeout, up from an earlier unverified 6 s guess) — budget for that in anything
-  downstream that waits on it (e.g. a UI "thinking" state).
+- `decision_client.py` — two call shapes against the same OpenAI-compatible endpoint:
+  - `choose_snack_and_reply(text, snacks) -> (snack_id, reply)` — the original one-shot shape. Still used by
+    `decision_service.py`/`tools/try_request.py` for a quick single-question test in isolation.
+  - `converse(messages, snacks) -> ConversationTurn` — the real multi-turn shape, used by
+    `ConversationSession`. Schema adds `done` and `percentages` (see History #5). Percentages are
+    re-normalized in code (`_normalize_percentages`) to always sum to 100, since the model's raw numbers often
+    don't.
+  Both: 15 s timeout, one retry only on 429/5xx (`temperature` omitted by default — `gpt-5-nano` 400s on
+  anything but its default of 1). Reply validation (non-empty, no URL; <=160 chars + must-mention-the-snack
+  only for a one-shot reply or a `done=true` reveal line; a more lenient length-only cap for intermediate
+  conversational turns) — any failure raises `DecisionError`, treated as "say a hardcoded apology line," never
+  something that reaches the guest as a crash. System prompt frames the guest's text as DATA, never
+  instructions (prompt-injection defense). **Measured with real keys**: a `gpt-5-nano` structured-output call
+  took ~11 s end to end (hence the 15 s timeout) — budget for that downstream (e.g. a UI "thinking" state).
+- `conversation_session.py` — `ConversationSession`, one per guest: owns the growing chat-history list,
+  `.start()` kicks off Tubi's intro, `.respond(guest_text)` feeds one guest turn and returns Tubi's next line.
+  When a turn comes back `done=true`, `.result` is set to a `QuizResult` (session_id, chosen_snack_id, slot,
+  percentages, transcript) and further `.respond()` calls raise. On a `DecisionError`, rolls back the
+  just-appended guest turn before returning a fallback line, so a failed call doesn't poison the history the
+  next real call sees.
 - `tts_client.py` — ElevenLabs. `TtsClient.synthesize(text) -> bytes`. `TtsError` subtypes map
   timeout/request/invalid-response failures the same way as the decision client.
 - `audio_player.py` — `AudioPlayer.play(mp3_bytes)`. Shells out to `afplay`/`mpg123`/`ffplay` (whichever is
   found) rather than pulling in a Python audio dependency. Never raises; missing player or playback failure just
   means no audio played, same severity as a TTS failure.
-- `message_package.py` — `SnackMessage(request_id, snack_id, slot, reply_text, audio_mp3, source)`. `audio_mp3`
-  is `None` when TTS was skipped (budget) or failed — that's a normal, expected state, not an error state.
-- `decision_service.py` — orchestrates the above into one `handle(request_id, text, snacks) -> SnackMessage`
-  call. Never raises.
+- `message_package.py` / `decision_service.py` — the older one-shot pipeline (`SnackMessage`,
+  `DecisionService.handle()`). Kept for `tools/try_request.py`'s quick single-question tests; not what drives
+  a real conversation anymore (see `teammate_client.py`/`conversation_session.py`).
 - `esp32_link.py` — `EspLink` interface (`open_trap_door()`/`close_trap_door()`), `NullEspLink` (dev/no
   hardware), `SerialEspLink` (pyserial, writes a single `b'1'`/`b'2'` byte at 115200 baud — matches the real
-  firmware exactly, see History #4). No per-slot routing yet; `SnackMessage.slot` is unused here until the
+  firmware exactly, see History #4). No per-slot routing yet; `QuizResult.slot` is unused here until the
   firmware grows that.
 - `teammate_client.py` — `TeammateClient`, an `aiohttp` WS **client** connecting OUT to `WEBSITE_WS_URL`.
-  Ignores every message except `{"type":"transcript",...}`; on one, runs `DecisionService` off the event loop
-  (`run_in_executor`), sends `display`/`state` messages back, plays audio locally, then pulses the trap door
-  open then closed (`DISPENSE_OPEN_SECONDS`). Auto-reconnects with a fixed delay on disconnect.
+  `session:start` creates a `ConversationSession` and speaks its intro; `transcript` feeds the active session
+  and speaks the reply; on `done`, sends the extended `display` (with `percentages`), pulses the trap door
+  (`DISPENSE_OPEN_SECONDS`), and writes the `QuizResult` to `tools/quiz_result.json`. Both the decision call and
+  the TTS call are budget-gated per turn (`RequestBudget`/`CharacterBudget`), degrading to a fallback line or
+  text-only rather than erroring. Auto-reconnects with a fixed delay on disconnect.
 - `tools/try_request.py` — standalone CLI, no website/ESP32 needed: runs one piece of text through the real
-  `DecisionService` (real API calls) and prints the resulting package + saves the audio to a file. This is the
-  "test without either" path.
+  one-shot `DecisionService` (real API calls) and prints the resulting package + saves the audio to a file.
+  Good for a quick isolated check of the decision+TTS pipeline, not the real conversation.
+- `tools/talk_to_tubi.py` — the real "test without either" path: have the actual multi-turn conversation by
+  voice, using the dev machine's own mic + local Whisper STT (matching `website/python/stt_worker.py`'s
+  approach, so it doesn't spend API credits on transcription) — no website, ESP32, or Pi needed. Needs
+  `tools/requirements-mic.txt` installed separately (SpeechRecognition/pyaudio/openai-whisper — deliberately
+  NOT in `requirements.txt`, since whisper pulls in torch and has no business running on a Pi 3).
 
 ## Secrets
 `LLM_API_KEY` (decision calls, OpenAI-compatible), `TTS_API_KEY` (ElevenLabs) — from env or an untracked
@@ -152,27 +181,32 @@ Schema (validate on load with clear errors):
 `secrets.env.example`) so nothing is hardcoded.
 
 ## What's missing / still open
+- The `speak` message and `display.percentages` addition (`pi_app/docs/multi_turn_contract_proposal.md`) aren't
+  built on the website side yet — `teammate_client.py` sends them, but nothing there re-arms the mic after each
+  Tubi turn or displays the running conversation. Real end-to-end multi-turn needs that built first.
 - The real per-slot ESP32 routing (firmware only supports one trap door open/close right now, not a snack
-  selector) — `SnackMessage.slot` is ready for it, `esp32_link.py` isn't yet.
+  selector) — `QuizResult.slot` is ready for it, `esp32_link.py` isn't yet.
 - The duplicate `slot: 3` bug in `pi_app/config/snacks.json` (two snacks claim the same physical position).
 - `docs/esp32_protocol.md` — never written; the real protocol turned out to be much simpler (one byte) than
   originally planned (JSON + chunked audio), so this may not even be needed unless the protocol grows.
-- A real end-to-end test with live API keys and the actual website + ESP32 (everything so far is tested against
-  fake local HTTP/WS servers and a fake serial object) — use `tools/try_request.py` to test the cloud-call half
-  without either.
+- A real end-to-end test with live API keys and the actual website + ESP32 — use `tools/talk_to_tubi.py` to test
+  the real conversation by voice without either, or `tools/try_request.py` for a single-question check.
 - systemd unit for autostart on boot, `EnvironmentFile=` for secrets.
 - RAM re-measurement on the real Pi (Phase 2) — expected to be easy now, but unverified.
 - Coordinating with the website teammate on exactly where/how the site is hosted (their `CLAUDE.md` currently
   assumes Render, which is a different plan than "the Pi hosts it") and the HTTPS tunnel in front of it.
 
 ## Tests
-- Unit: `snacks.json` validation + hot reload, `RequestBudget`/`CharacterBudget` caps, `DecisionClient` against a
-  fake HTTP server (success/invalid snack/bad JSON/429-retry/non-retryable error/timeout/connection
-  refused/content validation failures), `TtsClient` against a fake ElevenLabs-shaped server (success/non-200/
-  timeout/connection refused/payload shape), `DecisionService`'s budget/error/success paths, `EspLink` against a
-  fake serial object, `AudioPlayer` against fake player commands, `TeammateClient` both via direct
-  `handle_message()` calls and one real-websocket round-trip test against an in-process `aiohttp` test server.
-- Still needed: a real integration test once the website and ESP32 are both reachable together;
+- Unit: `snacks.json` validation + hot reload, `RequestBudget`/`CharacterBudget` caps, `dotenv.py`'s loader,
+  `DecisionClient` against a fake HTTP server — both `choose_snack_and_reply` (success/invalid snack/bad
+  JSON/429-retry/non-retryable error/timeout/connection refused/content validation) and `converse`
+  (not-done/done/percentage-normalization/invalid-snack/reply-doesn't-mention-snack/too-long/bad-json),
+  `TtsClient` against a fake ElevenLabs-shaped server, `DecisionService`'s budget/error/success paths,
+  `ConversationSession` against a stub client (history accumulation, reaching done, rollback-on-error,
+  raising if you `.respond()` after done), `EspLink` against a fake serial object, `AudioPlayer` against fake
+  player commands, `TeammateClient` via direct `handle_message()` calls (session:start/transcript/session:end,
+  budget exhaustion on both budgets, reveal+dispense+file-write) and one real-websocket round-trip test.
+- Still needed: a real integration test once the website contract addition and ESP32 are both built;
   `tools/smoke_pi.sh` (checks internet reachability and the env key *names*, never values, plus the serial
   device).
 

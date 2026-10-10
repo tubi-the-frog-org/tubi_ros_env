@@ -49,7 +49,20 @@ class ConversationSession:
         self._client = client
         self._snacks = snacks
         self._logger = logger or logging.getLogger(__name__)
-        self._messages: list[dict] = [{"role": "system", "content": build_system_prompt(snacks.snacks)}]
+
+        # The default/fallback snack (e.g. "none") is reserved for the
+        # orchestration layer's own fallback (budget exhausted, DecisionError)
+        # -- it's never a genuine quiz outcome. Excluding it from both the
+        # prompt's listing and the schema's enum makes that a hard guarantee
+        # (the model structurally can't pick it) rather than a soft
+        # instruction it might ignore; it also sidesteps an awkward mention
+        # check, since "No snack" doesn't naturally fit into a reveal line.
+        self._choosable_snacks = [s for s in snacks.snacks if s.id != snacks.default_snack]
+        if not self._choosable_snacks:
+            self._logger.warning(f"[{session_id}] no non-default snacks configured; falling back to the full list")
+            self._choosable_snacks = snacks.snacks
+
+        self._messages: list[dict] = [{"role": "system", "content": build_system_prompt(self._choosable_snacks)}]
         self.done = False
         self.result: QuizResult | None = None
 
@@ -66,7 +79,7 @@ class ConversationSession:
         self._messages.append({"role": "user", "content": user_text})
 
         try:
-            turn = self._client.converse(self._messages, self._snacks.snacks)
+            turn = self._client.converse(self._messages, self._choosable_snacks)
         except DecisionError as e:
             self._logger.warning(f"[{self.session_id}] conversation call failed: {e}")
             self._messages.pop()  # don't poison history with a turn that never happened

@@ -17,7 +17,7 @@ class StubDecisionClient:
         self._turns = list(turns)
         self.calls = 0
 
-    def converse(self, messages, snacks):
+    def converse(self, messages, snacks, force_done=False):
         turn = self._turns[min(self.calls, len(self._turns) - 1)]
         self.calls += 1
         return turn

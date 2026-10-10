@@ -65,6 +65,13 @@ def test_validate_reply_accepts_label_or_alias_mention():
     validate_reply("Chips, destiny demands it!", CHIPS)  # label
 
 
+def test_validate_reply_accepts_punctuation_variation_in_label():
+    # a real failure: label "m&ms" didn't match a reply naturally written
+    # "M&M's" (apostrophe) -- punctuation differences shouldn't matter.
+    mms = Snack(id="m&ms", label="m&ms", slot=1, aliases=[], tags=[], lines=[])
+    validate_reply("Your fate is sealed: M&M's await you, traveler!", mms)
+
+
 def test_choose_snack_and_reply_success():
     with FakeDecisionServer(responses=[{"status": 200, "snack": "chips", "reply": "The crunchy chips await!"}]) as server:
         client = _client(server.url)
@@ -146,8 +153,15 @@ def _history():
 def test_build_conversation_schema_shape():
     schema = build_conversation_schema(["cookies", "chips"])
     assert schema["properties"]["snack"]["enum"] == ["cookies", "chips", "undecided"]
+    assert schema["properties"]["done"] == {"type": "boolean"}
     assert set(schema["properties"]["percentages"]["properties"]) == {"cookies", "chips"}
     assert schema["required"] == ["done", "snack", "reply", "percentages"]
+
+
+def test_build_conversation_schema_force_done_locks_done_and_drops_undecided():
+    schema = build_conversation_schema(["cookies", "chips"], force_done=True)
+    assert schema["properties"]["done"] == {"type": "boolean", "enum": [True]}
+    assert schema["properties"]["snack"]["enum"] == ["cookies", "chips"]  # no "undecided"
 
 
 def _not_done_content(reply="Greetings! Tell me about yourself."):

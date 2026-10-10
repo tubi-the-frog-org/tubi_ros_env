@@ -39,7 +39,9 @@ _UNDECIDED = "undecided"
 # instructions -- a prompt-injection defense, since that text is
 # guest-supplied and untrusted.
 _SYSTEM_PROMPT_TEMPLATE = (
-    "You are a wizard frog named Tubi. Snacks available: {snack_list}. "
+    "You are a wizard frog named Tubi. You must act like Master oogway from Kung Fu Panda. Snacks available: {snack_list}. "
+    "ALL OF YOUR ANSWERS BACK TO THE GUEST MUST BE SOME WISE THING A WIZARD WOULD SAY. Make sure you have a hard "
+    "time remembering, but obviously don't just drop that in, make it natural and goofy. "
     "You are having a multi-turn SPOKEN conversation with a guest -- they can only answer ONE thing per turn, "
     "so every reply you give must contain AT MOST ONE question. Never stack multiple questions in the same "
     "reply (e.g. never ask 'are you X or Y? Also, do you prefer A or B?' in one turn -- pick just one). The "
@@ -52,8 +54,12 @@ _SYSTEM_PROMPT_TEMPLATE = (
     "guest's personality and general preferences -- how they feel, what they enjoy, their day-to-day vibe. "
     "NEVER mention or hint at snacks, food, flavor, or texture (e.g. sweet, salty, crunchy, soft) in these "
     "questions -- keep them entirely about the person, not food, so the guest can't just answer with a snack "
-    "name. Each question should be answerable instantly by a 5th grader, no overthinking required. Keep every "
-    "reply to one short sentence of setup (if any) plus your one short question.\n\n"
+    "name. Each question should be answerable instantly by a 5th grader, no overthinking required.\n\n"
+    "IMPORTANT STYLE SWITCH for this question phase ONLY: drop the wizardly monologue entirely. Save the "
+    "Oogway-style wisdom and the forgetful-wizard bit for the intro and the final reveal -- here, during the "
+    "questions, just ask the question, plainly and directly, with NO reaction to their last answer and no "
+    "wise remark first. Most of your reply here should be ONLY the question itself, nothing else. Add a brief "
+    "one-clause reaction ONLY if something they said truly calls for it -- that should be rare, not the norm.\n\n"
     "Do not reveal a snack until the guest clearly confirms they're ready (e.g. \"yes\", \"go ahead\", \"show "
     "me\"). Until then: set done=false, snack=\"{undecided}\", and leave percentages at 0 for every snack -- "
     "those fields are ignored until done=true.\n\n"
@@ -101,12 +107,19 @@ def build_system_prompt(snacks: list[Snack]) -> str:
     return _SYSTEM_PROMPT_TEMPLATE.format(snack_list=snack_list, undecided=_UNDECIDED)
 
 
-def build_conversation_schema(snack_ids: list[str]) -> dict:
+def build_conversation_schema(snack_ids: list[str], force_done: bool = False) -> dict:
+    """force_done=True locks `done` to literally only accept true AND drops
+    "undecided" from `snack`'s enum, so the model is structurally required
+    to both stop stalling and commit to a real snack -- used as a last
+    resort once a conversation has run long (see ConversationSession's
+    question cap), since a prompt instruction alone wasn't reliably enough
+    to make the model wrap up (measured: it would say done=true but still
+    leave snack="undecided", since only `done` was locked)."""
     return {
         "type": "object",
         "properties": {
-            "done": {"type": "boolean"},
-            "snack": {"type": "string", "enum": [*snack_ids, _UNDECIDED]},
+            "done": {"type": "boolean", "enum": [True]} if force_done else {"type": "boolean"},
+            "snack": {"type": "string", "enum": snack_ids if force_done else [*snack_ids, _UNDECIDED]},
             "reply": {"type": "string"},
             "percentages": {
                 "type": "object",
@@ -128,10 +141,21 @@ class ConversationTurn:
     percentages: dict[str, float] | None  # only meaningful when done, normalized to sum to 100
 
 
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _normalize_for_mention(text: str) -> str:
+    """Strips punctuation/spacing so e.g. the label "m&ms" still matches a
+    reply that naturally writes "M&M's" -- measured a real snack with an
+    "&" in its label reliably failing an exact-substring check because the
+    model wrote the more natural spelling with an apostrophe."""
+    return _NON_ALNUM_RE.sub("", text.lower())
+
+
 def _mentions_snack(reply: str, snack: Snack) -> bool:
-    reply_lower = reply.lower()
+    reply_norm = _normalize_for_mention(reply)
     names = [snack.label, *snack.aliases]
-    return any(name.lower() in reply_lower for name in names if name)
+    return any(_normalize_for_mention(name) in reply_norm for name in names if name)
 
 
 def validate_reply(reply: str, snack: Snack) -> None:
@@ -238,11 +262,12 @@ class DecisionClient:
 
         return snack_id, reply
 
-    def converse(self, messages: list[dict], snacks: list[Snack]) -> ConversationTurn:
+    def converse(self, messages: list[dict], snacks: list[Snack], force_done: bool = False) -> ConversationTurn:
         """One turn of the multi-turn flow. `messages` is the full chat
         history so far (system prompt first, then alternating
         user/assistant turns) -- the caller owns growing that list.
-        Raises a DecisionError subtype on any failure."""
+        Raises a DecisionError subtype on any failure. See
+        build_conversation_schema for what force_done does."""
         snack_ids = [s.id for s in snacks]
         payload = {
             "model": self.model,
@@ -252,7 +277,7 @@ class DecisionClient:
                 "json_schema": {
                     "name": "conversation_turn",
                     "strict": True,
-                    "schema": build_conversation_schema(snack_ids),
+                    "schema": build_conversation_schema(snack_ids, force_done=force_done),
                 },
             },
         }

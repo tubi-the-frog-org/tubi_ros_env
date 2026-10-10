@@ -16,15 +16,41 @@ the same rigor as a validated psychometric instrument.
 from __future__ import annotations
 
 import logging
+import random
 from dataclasses import dataclass
 
 from pi_app.decision_client import DecisionClient, DecisionError, build_system_prompt
 from pi_app.snacks import SnacksConfig
 
-_FALLBACK_REPLY = "The fog clouds my sight for a moment... could you say that again, traveler?"
+# Varied and in-character (Tubi's whole bit is a forgetful wizard) rather than
+# one fixed line -- repeating the exact same sentence on consecutive failures
+# reads as broken, not charming (this happened in a real test run: the same
+# apology three times in a row looked like a glitch, not a bit).
+_GOOFY_RETRY_REPLIES = [
+    "Oh dear, my enchanted earwax clogged up again -- what was that, traveler?",
+    "Hmm, a pond toad nibbled your words right out of the air! Say it once more?",
+    "My memory crystal just fogged over -- mind repeating that for an old frog?",
+    "A passing cloud swallowed your sentence whole! One more time, please?",
+    "My ears are full of lily pads today -- could you say that again, traveler?",
+]
+_FORCE_FINALIZE_REPLY_TEMPLATE = "My crystal ball flickers and settles... {label} it shall be, traveler!"
 _START_PROMPT = (
     "(The guest has just arrived and hasn't said anything yet. Begin: introduce yourself with your usual "
     "mixed-up backstory, then ask them to introduce themselves.)"
+)
+
+# A prompt instruction alone ("ask 2-4 questions") isn't reliably enough --
+# measured a real run asking 10+ questions in a row, never reaching done.
+# This is a demo: a bored judge matters more than one extra clever question.
+# So the question count is tracked and enforced in code, with two rungs:
+# a nudge first (model still has a say), then a structurally-forced reveal
+# (it doesn't) if that didn't work.
+_NUDGE_AFTER_TURNS = 4
+_FORCE_AFTER_TURNS = 6
+_WRAP_UP_NUDGE = (
+    "(Internal note, not from the guest -- you've asked enough questions now. Do not ask any more personality "
+    "questions. If the guest hasn't confirmed they're ready yet, ask clearly if they'd like their result now. "
+    "If they already confirmed, you MUST set done=true this turn and reveal.)"
 )
 
 
@@ -65,27 +91,45 @@ class ConversationSession:
         self._messages: list[dict] = [{"role": "system", "content": build_system_prompt(self._choosable_snacks)}]
         self.done = False
         self.result: QuizResult | None = None
+        self._turn_count = 0  # counts turns after the intro; the intro/name-exchange itself doesn't count
 
     def start(self) -> str:
         """Call once per session, before any guest speech, to get Tubi's opening line."""
-        return self._step(_START_PROMPT)
+        return self._step(_START_PROMPT, is_intro=True)
 
     def respond(self, guest_text: str) -> str:
         if self.done:
             raise RuntimeError(f"session {self.session_id} already finished")
         return self._step(guest_text)
 
-    def _step(self, user_text: str) -> str:
+    def _step(self, user_text: str, is_intro: bool = False) -> str:
         self._messages.append({"role": "user", "content": user_text})
 
+        force_done = self._turn_count >= _FORCE_AFTER_TURNS
+        send_messages = self._messages
+        if not is_intro and self._turn_count >= _NUDGE_AFTER_TURNS:
+            send_messages = [*self._messages, {"role": "system", "content": _WRAP_UP_NUDGE}]
+
         try:
-            turn = self._client.converse(self._messages, self._choosable_snacks)
+            turn = self._client.converse(send_messages, self._choosable_snacks, force_done=force_done)
         except DecisionError as e:
-            self._logger.warning(f"[{self.session_id}] conversation call failed: {e}")
             self._messages.pop()  # don't poison history with a turn that never happened
-            return _FALLBACK_REPLY
+            if force_done:
+                # We've already given the model every chance (a nudge, then a
+                # structurally-forced done=true) and it still didn't commit to
+                # a real snack (e.g. it can still say snack="undecided" even
+                # with done locked true -- that field's enum isn't locked).
+                # A failed call never advances _turn_count, so simply retrying
+                # here could loop forever. A demo must never hang on an LLM
+                # that won't cooperate, so finish the session locally instead.
+                self._logger.warning(f"[{self.session_id}] forced reveal still failed ({e}); finalizing locally")
+                return self._finalize_locally()
+            self._logger.warning(f"[{self.session_id}] conversation call failed: {e}")
+            return random.choice(_GOOFY_RETRY_REPLIES)
 
         self._messages.append({"role": "assistant", "content": turn.reply_text})
+        if not is_intro:
+            self._turn_count += 1
 
         if turn.done:
             self.done = True
@@ -99,3 +143,20 @@ class ConversationSession:
             )
 
         return turn.reply_text
+
+    def _finalize_locally(self) -> str:
+        """Last-resort termination, no further LLM call: pick a snack
+        ourselves (random, since we have no real signal the model failed
+        to give us) and finish the session. Guarantees a demo never hangs
+        on an uncooperative model."""
+        snack = random.choice(self._choosable_snacks)
+        self.done = True
+        even_share = round(100.0 / len(self._choosable_snacks), 1)
+        self.result = QuizResult(
+            session_id=self.session_id,
+            chosen_snack_id=snack.id,
+            slot=snack.slot,
+            percentages={s.id: even_share for s in self._choosable_snacks},
+            transcript=[m for m in self._messages if m["role"] != "system"],
+        )
+        return _FORCE_FINALIZE_REPLY_TEMPLATE.format(label=snack.label)

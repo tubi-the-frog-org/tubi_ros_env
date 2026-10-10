@@ -116,207 +116,462 @@ those calibrated values(typically 1000-2000us) and the control frequency
 operating point 4.Use Pulse width to verify against an oscillopscope or logic
 analyzer during debugging
 */
+
 /*
- * ESP32 potentiometer -> ESC throttle via MCPWM (50 Hz, 1000-2000 us)
+ * Tubi the Wizard Frog -- 4 hobby servos on one MCPWM timer (50 Hz)
  * Board: DOIT ESP32 DEVKIT V1 (ESP32-D0WD-V3)
  *
- * Wiring:
- *   Pot wiper -> GPIO36 (VP)   [ADC1_CHANNEL_0, input-only pin]
- *   ESC signal -> GPIO18
- *   Share GND between the ESC, the pot and the ESP32
+ *   servo      GPIO   job
+ *   HEAD       5      bobs up at the start of every spoken word, down at the end
+ *   ARM        18     up/down gesture
+ *   LAZY SUSAN 19     positional servo, 4 bins
+ *   TRAP DOOR  32     closed / open
+ *   Share GND between the servo supply and the ESP32.
  *
- * Needs `esp_adc` in the REQUIRES list of src/CMakeLists.txt:
- *   REQUIRES driver esp_adc log freertos
- 
-
- 
+ * One timer feeds two operators; each operator has two comparator/generator
+ * pairs -> 4 independent pulse widths from one MCPWM group. All four servos
+ * are slewed toward their targets in the same 20 ms loop, so they move at the
+ * same time, each at its own speed.
+ *
+ * ---- Serial protocol (UART0, 115200, one command per line, '\n' ends it) ---
+ * Works from the Pi AND from a plain serial monitor (pio device monitor).
+ *
+ *   Any mode:
+ *     status                  print mode, state and every servo's angle/pulse
+ *     test | run              switch mode (boots in RUN)
+ *     bin <1-4>               lazy susan to bin 1..4          (alias: slot)
+ *     door open | close       trap door
+ *     head up | down          head to its calibrated pose
+ *     arm  up | down          arm  to its calibrated pose
+ *     talk <ms> <ms> ...      one entry per word: that word's duration in ms.
+ *                             Head AND arm go up when each word starts and dip
+ *                             back down before it ends. After the last word
+ *                             the head drops but the arm STAYS UP (use
+ *                             "arm down" or "stop" to lower it). Runs by itself -- no serial traffic
+ *                             between words, so no timing jitter.
+ *     stop                    abort a talk, head AND arm back to rest
+ *
+ *   TEST mode only (find out how far each servo should go):
+ *     head <deg>   arm <deg>   lazy <deg>   door <deg>
+ *     deg is 0..180, clamped to that servo's safe limits (see servos[]).
+ *     Type e.g. "head 105", look at the linkage, repeat. Then copy the numbers
+ *     into the POSE_* constants below.
  */
 
-
+#include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <stdbool.h>
 #include "driver/mcpwm_prelude.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/uart.h"
 #include "esp_log.h"
-#include "adc.h"
 #include "pwm.h"
 
-#define UART_NUM UART_NUM_0
-#define BUFFER_SIZE 128
-static const char *uart_tag = "UART";
-/* ---- Main ------------------------------------------------------------- */
-
-
+#define UART_NUM            UART_NUM_0
+#define BUFFER_SIZE         512             /* UART rx ring = 2x this */
+#define LINE_MAX_LEN        512
 
 static const char *PWMTAG = "PWM";
 
-#define PWM_GPIO            GPIO_NUM_18       /* check against the DEVKIT V1 pinout */
-#define PWM_GROUP_ID        0                 /* timer and operator must share a group */
 #define PWM_RESOLUTION_HZ   1000000           /* 1 MHz -> 1 tick = 1 us */
 #define PWM_PERIOD_TICKS    20000             /* 20000 us = 20 ms = 50 Hz */
-
-
-//DIRECTIONAL MOVEMENT FOR LAZY SUZAN TABLE!!!!
-#define LAZY_POS_4  400
-#define LAZY_POS_3   1200              /* full reverse (bidirectional ESC) */
-#define LAZY_POS_2 1900              /* neutral / stopped */
-#define LAZY_POS_1    2500              /* full forward */
-
-//DIRECTIONAL MOVEMENT FOR SERVO TRAP DOOR!!!!
-#define TRAP_DOOR_CLOSE 1800 //starting the position
-#define TRAP_DOOR_OPEN  2400 //opening position??
-
-#define ESC_ARM_TIME_MS     2000              /* hold neutral at boot so the ESC arms */
 #define CONTROL_PERIOD_MS   20                /* one update per PWM period */
-#define RAMP_STEP_US        12                 /* 5 us / 20 ms -> 1000 us takes ~4 s */
 
+/* ---- Calibrated poses (degrees) --------------------------------------- *
+ * TUNE THESE in test mode. HEAD/ARM numbers are placeholders. The door and
+ * lazy susan values are the old pulse widths converted at 500-2500 us = 0-180.
+ */
+#define POSE_HEAD_DOWN      150.0f            /* measured */
+#define POSE_HEAD_UP        100.0f            /* measured */
+#define POSE_ARM_DOWN       80.0f             /* measured: rest position */
+#define POSE_ARM_UP         0.0f              /* measured: raised */
+#define POSE_ARM_WORD_LOW   40.0f             /* arm dips to here between words, halfway down (TUNE) */
+#define POSE_DOOR_CLOSED    117.0f            /* was 1800 us */
+#define POSE_DOOR_OPEN      171.0f            /* was 2400 us */
 
+#define NUM_BINS            4
+#define POSE_BIN1_DEG       180.0f            /* was 2500 us */
+#define POSE_BIN2_DEG       126.0f            /* was 1900 us */
+#define POSE_BIN3_DEG       63.0f             /* was 1200 us */
+#define POSE_BIN4_DEG       0.0f              /* was 400 us (below the 500 us clamp, so 0 deg) */
+static const float POSE_BIN_DEG[NUM_BINS] = {
+    POSE_BIN1_DEG, POSE_BIN2_DEG, POSE_BIN3_DEG, POSE_BIN4_DEG,
+};
 
-static uint32_t current_us = LAZY_POS_1;   /* last commanded pulse */
+/* While talking: head is up for this fraction of each word, then drops. */
+#define TALK_UP_FRACTION    0.6f
+#define TALK_MAX_WORDS      64
 
-/* Turn a raw pot reading into a target pulse width. Swap this function out
- * to change how the pot behaves (see the proportional version in the chat). */
-// static uint32_t target_from_adc(int raw)
-// {
-//     if (raw < ADC_LOW_THRESHOLD)  return ESC_MIN_PULSE_US;
-//     if (raw > ADC_HIGH_THRESHOLD) return ESC_MAX_PULSE_US;
-//     return ESC_MIDDLE_PULSE_US;
-// }
+/* ---- Servo table ------------------------------------------------------ */
 
-/* ---- ESC helpers ------------------------------------------------------ */
+typedef enum { SERVO_HEAD, SERVO_ARM, SERVO_LAZY, SERVO_DOOR, SERVO_COUNT } servo_id_t;
 
-static uint32_t esc_clamp_us(uint32_t us)
+typedef struct {
+    const char *name;
+    gpio_num_t gpio;
+    uint32_t min_us, max_us;        /* pulse at 0 deg and at 180 deg */
+    float min_deg, max_deg;         /* safe travel -- test-mode input is clamped to this */
+    uint32_t step_us;               /* max pulse change per 20 ms tick (speed) */
+    float home_deg;                 /* where it sits at boot */
+    mcpwm_cmpr_handle_t cmpr;
+    mcpwm_gen_handle_t gen;
+    uint32_t current_us;
+    uint32_t target_us;
+} servo_t;
+
+static servo_t servos[SERVO_COUNT] = {
+    [SERVO_HEAD] = { .name = "head", .gpio = GPIO_NUM_5 , .min_us = 500, .max_us = 2500,
+                     .min_deg = 60,  .max_deg = 150, .step_us = 100, .home_deg = POSE_HEAD_DOWN },
+    [SERVO_ARM]  = { .name = "arm",  .gpio = GPIO_NUM_18, .min_us = 500, .max_us = 2500,
+                     .min_deg = 0,   .max_deg = 180, .step_us = 120, .home_deg = POSE_ARM_DOWN },
+    [SERVO_LAZY] = { .name = "lazy", .gpio = GPIO_NUM_19, .min_us = 500, .max_us = 2500,
+                     .min_deg = 0,   .max_deg = 180, .step_us = 25,  .home_deg = POSE_BIN1_DEG },
+    [SERVO_DOOR] = { .name = "door", .gpio = GPIO_NUM_32, .min_us = 500, .max_us = 2500,
+                     .min_deg = 90,  .max_deg = 180, .step_us = 12,  .home_deg = POSE_DOOR_CLOSED },
+};
+
+static uint32_t deg_to_us(const servo_t *s, float deg)
 {
-    if (us < 500) return 500;
-    if (us > 2500) return 2500;
-    return us;
+    return s->min_us + (uint32_t)((deg / 180.0f) * (float)(s->max_us - s->min_us) + 0.5f);
 }
 
-/* Set the pulse width immediately (clamped). Ticks == microseconds at 1 MHz. */
-static esp_err_t esc_set_pulse_us(mcpwm_cmpr_handle_t comparator, uint32_t pulse_us)
+static float us_to_deg(const servo_t *s, uint32_t us)
 {
-    pulse_us = esc_clamp_us(pulse_us);
-    current_us = pulse_us;
-    return mcpwm_comparator_set_compare_value(comparator, pulse_us);
+    return ((float)us - (float)s->min_us) * 180.0f / (float)(s->max_us - s->min_us);
 }
 
-
-
-
-
-
-
-
-
-
-/* Move ONE slew step toward the target. Non-blocking: call once per control
- * period so the caller can keep reading inputs while the output ramps. */
-static void esc_step_toward(mcpwm_cmpr_handle_t comparator, uint32_t target_us)
+/* Set a new target angle (clamped to the servo's safe range). Returns the
+ * angle actually used. The 20 ms loop slews the servo there. */
+static float servo_set_angle(servo_id_t id, float deg)
 {
-    target_us = esc_clamp_us(target_us);
-    if (current_us == target_us) {
+    servo_t *s = &servos[id];
+    if (deg < s->min_deg) deg = s->min_deg;
+    if (deg > s->max_deg) deg = s->max_deg;
+    s->target_us = deg_to_us(s, deg);
+    return deg;
+}
+
+/* Move ONE slew step toward the target, called once per control period. */
+static void servo_tick(servo_t *s)
+{
+    if (s->current_us == s->target_us) {
         return;
     }
-
     uint32_t next;
-    if (current_us < target_us) {
-        next = (target_us - current_us < RAMP_STEP_US) ? target_us
-                                                       : current_us + RAMP_STEP_US;
+    if (s->current_us < s->target_us) {
+        next = (s->target_us - s->current_us < s->step_us) ? s->target_us
+                                                          : s->current_us + s->step_us;
     } else {
-        next = (current_us - target_us < RAMP_STEP_US) ? target_us
-                                                       : current_us - RAMP_STEP_US;
+        next = (s->current_us - s->target_us < s->step_us) ? s->target_us
+                                                          : s->current_us - s->step_us;
     }
-    ESP_ERROR_CHECK(esc_set_pulse_us(comparator, next));
+    s->current_us = next;
+    ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(s->cmpr, next));
 }
 
-//place the handles here....
-mcpwm_timer_handle_t timer = NULL;
-mcpwm_oper_handle_t oper = NULL;
-mcpwm_cmpr_handle_t comparator = NULL;
-mcpwm_gen_handle_t generator = NULL;
+/* ---- The four movement functions -------------------------------------- */
 
-void pwm_init(void){
-        /* 1. Timer: default clock source is the 160 MHz PLL, divided down to 1 MHz */
+/* 1. head: any angle 0..180 (clamped). */
+void move_head(float deg)            { servo_set_angle(SERVO_HEAD, deg); }
+
+/* 2. arm: any angle 0..180 (clamped). */
+void move_arm(float deg)             { servo_set_angle(SERVO_ARM, deg); }
+
+/* 3. lazy susan: bin 1..4. Returns false for a bad bin number. */
+bool move_lazy_susan(int bin)
+{
+    if (bin < 1 || bin > NUM_BINS) return false;
+    servo_set_angle(SERVO_LAZY, POSE_BIN_DEG[bin - 1]);
+    return true;
+}
+
+/* 4. trap door. */
+void move_trap_door(bool open)       { servo_set_angle(SERVO_DOOR, open ? POSE_DOOR_OPEN : POSE_DOOR_CLOSED); }
+
+/* ---- MCPWM setup ------------------------------------------------------ */
+
+static mcpwm_timer_handle_t timer = NULL;
+static mcpwm_oper_handle_t opers[2] = { NULL, NULL };
+
+void pwm_init(void)
+{
     mcpwm_timer_config_t timer_config = {
         .group_id      = 0,
         .clk_src       = MCPWM_TIMER_CLK_SRC_DEFAULT,
-        .resolution_hz = 1000000,
+        .resolution_hz = PWM_RESOLUTION_HZ,
         .count_mode    = MCPWM_TIMER_COUNT_MODE_UP,
-        .period_ticks  = 20000,
+        .period_ticks  = PWM_PERIOD_TICKS,
         .intr_priority = 0,
     };
     ESP_ERROR_CHECK(mcpwm_new_timer(&timer_config, &timer));
-    ESP_LOGI(PWMTAG, "Timer created");
 
-    /* 2. Operator: same group as the timer, then connected to it */
-    mcpwm_operator_config_t oper_config = {
-        .group_id      = 0,
-        .intr_priority = 0,
-    };
-    ESP_ERROR_CHECK(mcpwm_new_operator(&oper_config, &oper));
-    ESP_ERROR_CHECK(mcpwm_operator_connect_timer(oper, timer));
-    ESP_LOGI(PWMTAG, "Operator created and connected to timer");
+    /* An operator has 2 comparators + 2 generators, so 2 operators = 4 servos. */
+    mcpwm_operator_config_t oper_config = { .group_id = 0, .intr_priority = 0 };
+    for (int i = 0; i < 2; i++) {
+        ESP_ERROR_CHECK(mcpwm_new_operator(&oper_config, &opers[i]));
+        ESP_ERROR_CHECK(mcpwm_operator_connect_timer(opers[i], timer));
+    }
 
-    /* 3. Comparator: sets the pulse width. New values latch when the timer
-     * is empty (start of a period) so changes can't glitch a pulse. */
-    mcpwm_comparator_config_t cmpr_config = {
-        .intr_priority = 0,
-        .flags.update_cmp_on_tez = true,
-    };
-    ESP_ERROR_CHECK(mcpwm_new_comparator(oper, &cmpr_config, &comparator));
-    ESP_ERROR_CHECK(esc_set_pulse_us(comparator, LAZY_POS_1));//setting the default us
-    ESP_LOGI(PWMTAG, "Comparator created, pulse = %d us", LAZY_POS_1);
+    for (int i = 0; i < SERVO_COUNT; i++) {
+        servo_t *s = &servos[i];
+        mcpwm_oper_handle_t oper = opers[i / 2];
 
-    /* 4. Generator: drives the GPIO */
-    mcpwm_generator_config_t gen_config = {
-        .gen_gpio_num = GPIO_NUM_18,
-    };
-    ESP_ERROR_CHECK(mcpwm_new_generator(oper, &gen_config, &generator));
+        /* New compare values latch at the start of a period (no glitched pulses). */
+        mcpwm_comparator_config_t cmpr_config = { .intr_priority = 0, .flags.update_cmp_on_tez = true };
+        ESP_ERROR_CHECK(mcpwm_new_comparator(oper, &cmpr_config, &s->cmpr));
 
-    /* Period starts (timer empty): output HIGH */
-    ESP_ERROR_CHECK(mcpwm_generator_set_action_on_timer_event(
-        generator,
-        MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP,
-                                     MCPWM_TIMER_EVENT_EMPTY,
-                                     MCPWM_GEN_ACTION_HIGH)));
+        s->current_us = deg_to_us(s, s->home_deg);
+        s->target_us  = s->current_us;
+        ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(s->cmpr, s->current_us));
 
-    /* Timer reaches the compare value: output LOW */
-    ESP_ERROR_CHECK(mcpwm_generator_set_action_on_compare_event(
-        generator,
-        MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP,
-                                       comparator,
-                                       MCPWM_GEN_ACTION_LOW)));
-    ESP_LOGI(PWMTAG, "Generator created on GPIO %d", GPIO_NUM_18);
+        mcpwm_generator_config_t gen_config = { .gen_gpio_num = s->gpio };
+        ESP_ERROR_CHECK(mcpwm_new_generator(oper, &gen_config, &s->gen));
 
-    /* 5. Start the timer; hardware now runs the waveform on its own */
+        /* Period starts (timer empty): HIGH. Timer hits the compare value: LOW. */
+        ESP_ERROR_CHECK(mcpwm_generator_set_action_on_timer_event(
+            s->gen,
+            MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP,
+                                         MCPWM_TIMER_EVENT_EMPTY,
+                                         MCPWM_GEN_ACTION_HIGH)));
+        ESP_ERROR_CHECK(mcpwm_generator_set_action_on_compare_event(
+            s->gen,
+            MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP,
+                                           s->cmpr,
+                                           MCPWM_GEN_ACTION_LOW)));
+        ESP_LOGI(PWMTAG, "%s on GPIO %d, home %.0f deg (%u us)",
+                 s->name, s->gpio, s->home_deg, (unsigned)s->current_us);
+    }
+
     ESP_ERROR_CHECK(mcpwm_timer_enable(timer));
     ESP_ERROR_CHECK(mcpwm_timer_start_stop(timer, MCPWM_TIMER_START_NO_STOP));
-    // ESP_LOGI(PWMTAG, "PWM running: 50 Hz, %d us pulse", ESC_MIDDLE_PULSE_US);
-
-    // /* Hold neutral so the ESC can arm before any throttle is requested */
-    // ESP_LOGI(PWMTAG, "Arming ESC (%d ms at neutral)...", ESC_ARM_TIME_MS);
-    vTaskDelay(pdMS_TO_TICKS(ESC_ARM_TIME_MS));
-
 }
 
-uint32_t target_us = TRAP_DOOR_CLOSE;
-uint8_t ch;
+/* ---- State machine ---------------------------------------------------- *
+ *
+ *   mode:   MODE_RUN  (default) -- what the Pi drives
+ *           MODE_TEST           -- adds raw per-servo angle commands
+ *   state:  ST_IDLE
+ *           ST_TALKING -- stepping through the per-word schedule
+ *
+ *   TALKING, per word:  [word starts] head UP --(TALK_UP_FRACTION)--> head
+ *   DOWN --(rest of word)--> next word starts. After the last word: head and
+ *   arm down, back to IDLE. `stop` does the same early.
+ */
 
-void app_main(void){
-pwm_init();
-uart_driver_install(UART_NUM, BUFFER_SIZE * 2, 0, 0, NULL, 0);
-    while (1) {
-    if (uart_read_bytes(UART_NUM, &ch, 1, pdMS_TO_TICKS(CONTROL_PERIOD_MS)) > 0) {
-        switch (ch) {
-        case '2': target_us = TRAP_DOOR_OPEN; break;
-//        case '3': target_us = LAZY_POS_3;    break;
-        case '1': target_us = TRAP_DOOR_CLOSE;    break;
-//        case '4': target_us = LAZY_POS_4;   break;
-        default: break;
+typedef enum { MODE_RUN, MODE_TEST } mode_t_;
+typedef enum { ST_IDLE, ST_TALKING } state_t_;
+
+static mode_t_  mode  = MODE_RUN;
+static state_t_ state = ST_IDLE;
+
+static uint32_t talk_ms[TALK_MAX_WORDS];
+static int      talk_count = 0;
+static int      talk_idx = 0;
+static bool     talk_head_up = false;
+static int32_t  talk_next_event_ms = 0;     /* tick time of the next up/down flip */
+
+static int32_t now_ms(void)
+{
+    return (int32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+static void reply(const char *fmt, ...)
+{
+    char buf[160];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n > (int)sizeof(buf) - 3) n = sizeof(buf) - 3;
+    buf[n++] = '\n';
+    uart_write_bytes(UART_NUM, buf, n);
+}
+
+/* Natural end of a sentence: head drops, arm stays up. */
+static void talk_finish(void)
+{
+    state = ST_IDLE;
+    talk_head_up = false;
+    move_head(POSE_HEAD_DOWN);
+    move_arm(POSE_ARM_UP);
+}
+
+/* `stop` command: everything back to rest. */
+static void talk_stop(void)
+{
+    talk_finish();
+    move_arm(POSE_ARM_DOWN);
+}
+
+static void talk_begin_word(void)
+{
+    move_head(POSE_HEAD_UP);
+    move_arm(POSE_ARM_UP);
+    talk_head_up = true;
+    talk_next_event_ms = now_ms() + (int32_t)(talk_ms[talk_idx] * TALK_UP_FRACTION);
+}
+
+static void talk_start(void)
+{
+    state = ST_TALKING;
+    talk_idx = 0;
+    talk_begin_word();
+}
+
+/* Called every control period. */
+static void state_tick(void)
+{
+    if (state != ST_TALKING) return;
+    if ((int32_t)(now_ms() - talk_next_event_ms) < 0) return;
+
+    if (talk_head_up) {
+        /* Head drops at the end of the word; next word starts after the remainder. */
+        move_head(POSE_HEAD_DOWN);
+        /* The last word keeps the arm up; every other word dips it. */
+        if (talk_idx < talk_count - 1) move_arm(POSE_ARM_WORD_LOW);
+        talk_head_up = false;
+        talk_next_event_ms += (int32_t)(talk_ms[talk_idx] * (1.0f - TALK_UP_FRACTION));
+    } else {
+        talk_idx++;
+        if (talk_idx >= talk_count) {
+            talk_finish();
+            reply("OK talk done");
+        } else {
+            talk_begin_word();
         }
     }
-    esc_step_toward(comparator, target_us);   /* one slew step per loop */
 }
+
+/* ---- Command parser --------------------------------------------------- */
+
+static bool parse_float(const char *tok, float *out)
+{
+    if (!tok) return false;
+    char *end;
+    float v = strtof(tok, &end);
+    if (end == tok || *end != '\0') return false;
+    *out = v;
+    return true;
+}
+
+static void cmd_status(void)
+{
+    reply("mode=%s state=%s", mode == MODE_TEST ? "test" : "run", state == ST_TALKING ? "talking" : "idle");
+    for (int i = 0; i < SERVO_COUNT; i++) {
+        reply("  %-4s %6.1f deg  %4u us (target %4u us)  limits %.0f-%.0f deg",
+              servos[i].name, us_to_deg(&servos[i], servos[i].current_us),
+              (unsigned)servos[i].current_us, (unsigned)servos[i].target_us,
+              servos[i].min_deg, servos[i].max_deg);
+    }
+}
+
+/* head/arm/lazy/door: a keyword anywhere, a raw angle only in test mode. */
+static void cmd_servo(servo_id_t id, const char *arg)
+{
+    if (!arg) { reply("ERR %s needs an argument", servos[id].name); return; }
+
+    if (id == SERVO_HEAD && !strcmp(arg, "up"))    { move_head(POSE_HEAD_UP);   reply("OK head up"); return; }
+    if (id == SERVO_HEAD && !strcmp(arg, "down"))  { move_head(POSE_HEAD_DOWN); reply("OK head down"); return; }
+    if (id == SERVO_ARM  && !strcmp(arg, "up"))    { move_arm(POSE_ARM_UP);     reply("OK arm up"); return; }
+    if (id == SERVO_ARM  && !strcmp(arg, "down"))  { move_arm(POSE_ARM_DOWN);   reply("OK arm down"); return; }
+    if (id == SERVO_DOOR && !strcmp(arg, "open"))  { move_trap_door(true);      reply("OK door open"); return; }
+    if (id == SERVO_DOOR && !strcmp(arg, "close")) { move_trap_door(false);     reply("OK door close"); return; }
+
+    float deg;
+    if (!parse_float(arg, &deg)) { reply("ERR bad argument '%s'", arg); return; }
+    if (mode != MODE_TEST)       { reply("ERR raw angles need test mode (send 'test')"); return; }
+    float used = servo_set_angle(id, deg);
+    if (used != deg) reply("OK %s -> %.1f deg (clamped from %.1f)", servos[id].name, used, deg);
+    else             reply("OK %s -> %.1f deg", servos[id].name, used);
+}
+
+static void handle_line(char *line)
+{
+    for (char *p = line; *p; p++) *p = (char)tolower((unsigned char)*p);
+
+    char *save = NULL;
+    char *cmd = strtok_r(line, " \t", &save);
+    if (!cmd) return;
+
+    if (!strcmp(cmd, "status")) { cmd_status(); return; }
+
+    if (!strcmp(cmd, "test")) { mode = MODE_TEST; reply("OK mode=test"); return; }
+    if (!strcmp(cmd, "run"))  { mode = MODE_RUN;  reply("OK mode=run");  return; }
+
+    if (!strcmp(cmd, "stop")) { talk_stop(); reply("OK stopped"); return; }
+
+    if (!strcmp(cmd, "bin") || !strcmp(cmd, "slot")) {
+        char *arg = strtok_r(NULL, " \t", &save);
+        int bin = arg ? atoi(arg) : 0;
+        if (move_lazy_susan(bin)) reply("OK bin %d", bin);
+        else                      reply("ERR bin must be 1..%d", NUM_BINS);
+        return;
+    }
+
+    if (!strcmp(cmd, "talk")) {
+        int n = 0;
+        char *tok;
+        while (n < TALK_MAX_WORDS && (tok = strtok_r(NULL, " \t", &save)) != NULL) {
+            float ms;
+            if (!parse_float(tok, &ms) || ms < 50 || ms > 5000) { reply("ERR bad word duration '%s'", tok); return; }
+            talk_ms[n++] = (uint32_t)ms;
+        }
+        if (n == 0) { reply("ERR talk needs word durations in ms"); return; }
+        talk_count = n;
+        talk_start();
+        reply("OK talk %d words", n);
+        return;
+    }
+
+    char *arg = strtok_r(NULL, " \t", &save);
+    if (!strcmp(cmd, "head")) { cmd_servo(SERVO_HEAD, arg); return; }
+    if (!strcmp(cmd, "arm"))  { cmd_servo(SERVO_ARM, arg);  return; }
+    if (!strcmp(cmd, "lazy")) { cmd_servo(SERVO_LAZY, arg); return; }
+    if (!strcmp(cmd, "door")) { cmd_servo(SERVO_DOOR, arg); return; }
+
+    reply("ERR unknown command '%s'", cmd);
+}
+
+/* ---- Main ------------------------------------------------------------- */
+
+void app_main(void)
+{
+    pwm_init();
+    uart_driver_install(UART_NUM, BUFFER_SIZE * 2, 0, 0, NULL, 0);
+
+    static char line[LINE_MAX_LEN];
+    size_t len = 0;
+    bool overflow = false;
+    uint8_t chunk[64];
+
+    reply("Tubi ready (mode=run). Commands: status test run bin head arm door talk stop");
+
+    while (1) {
+        /* Waits up to one control period for input, which also paces the loop. */
+        int got = uart_read_bytes(UART_NUM, chunk, sizeof(chunk), pdMS_TO_TICKS(CONTROL_PERIOD_MS));
+        for (int i = 0; i < got; i++) {
+            char c = (char)chunk[i];
+            if (c == '\n' || c == '\r') {
+                if (overflow)      reply("ERR line too long");
+                else if (len > 0) { line[len] = '\0'; handle_line(line); }
+                len = 0;
+                overflow = false;
+            } else if (len < LINE_MAX_LEN - 1) {
+                line[len++] = c;
+            } else {
+                overflow = true;
+            }
+        }
+
+        state_tick();
+        for (int i = 0; i < SERVO_COUNT; i++) {
+            servo_tick(&servos[i]);
+        }
+    }
 }

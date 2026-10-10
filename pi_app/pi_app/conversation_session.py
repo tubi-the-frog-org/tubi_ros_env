@@ -40,9 +40,32 @@ _GOOFY_RETRY_REPLIES = [
     "My ears are full of lily pads today -- could you say that again, traveler?",
 ]
 _FORCE_FINALIZE_REPLY_TEMPLATE = "My crystal ball flickers and settles... {label} it shall be, traveler!"
+# Question topics for the either/or phase. Left to itself the model reuses
+# the same two or three questions every session, so each session gets its own
+# shuffled pool and is told to work through it in order.
+_QUESTION_BANK = [
+    "early bird or night owl",
+    "cats or dogs",
+    "beach or mountains",
+    "plan everything or wing it",
+    "loud party or cozy night in",
+    "sweet tooth or salty soul",
+    "book or movie",
+    "city or countryside",
+    "summer or winter",
+    "talk first or listen first",
+    "adventure or comfort",
+    "dance floor or karaoke mic",
+    "tidy desk or creative chaos",
+    "sunrise or sunset",
+    "coffee or tea",
+    "thrill ride or lazy river",
+]
+
 _START_PROMPT = (
-    "(The guest has just arrived and hasn't said anything yet. Begin: introduce yourself with your usual "
-    "mixed-up backstory, then ask them to introduce themselves.)"
+    "(The guest has just arrived and hasn't said anything yet. Begin with your INTRO step: one short sentence "
+    "introducing yourself with a froggy sound, a quick hint of what you'll do together, and ask their name. "
+    "Do not mention snacks.)"
 )
 
 # A prompt instruction alone ("ask 2-4 questions") isn't reliably enough --
@@ -51,8 +74,8 @@ _START_PROMPT = (
 # So the question count is tracked and enforced in code, with two rungs:
 # a nudge first (model still has a say), then a structurally-forced reveal
 # (it doesn't) if that didn't work.
-_NUDGE_AFTER_TURNS = 4
-_FORCE_AFTER_TURNS = 6
+_NUDGE_AFTER_TURNS = 6
+_FORCE_AFTER_TURNS = 8
 _WRAP_UP_NUDGE = (
     "(Internal note, not from the guest -- you've asked enough questions now. You have enough information to "
     "decide. Do not ask any more questions -- set done=true this turn, choose whichever snack(s) genuinely "
@@ -100,7 +123,11 @@ class ConversationSession:
             self._logger.warning(f"[{session_id}] no non-default snacks configured; falling back to the full list")
             self._choosable_snacks = snacks.snacks
 
-        self._messages: list[dict] = [{"role": "system", "content": build_system_prompt(self._choosable_snacks)}]
+        pool = random.sample(_QUESTION_BANK, 6)
+        system_prompt = build_system_prompt(self._choosable_snacks) + (
+            "\n\nQUESTION POOL for this guest, in order (phrase them your own goofy way): " + "; ".join(pool) + "."
+        )
+        self._messages: list[dict] = [{"role": "system", "content": system_prompt}]
         self.done = False
         self.result: QuizResult | None = None
         self._turn_count = 0  # counts turns after the intro; the intro/name-exchange itself doesn't count

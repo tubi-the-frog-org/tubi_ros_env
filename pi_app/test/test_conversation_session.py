@@ -1,4 +1,11 @@
-from pi_app.conversation_session import _GOOFY_RETRY_REPLIES, _WRAP_UP_NUDGE, ConversationSession, QuizResult
+from pi_app.conversation_session import (
+    _FORCE_AFTER_TURNS,
+    _GOOFY_RETRY_REPLIES,
+    _NUDGE_AFTER_TURNS,
+    _WRAP_UP_NUDGE,
+    ConversationSession,
+    QuizResult,
+)
 from pi_app.decision_client import ConversationTurn, DecisionError
 from pi_app.snacks import Line, Snack, SnacksConfig
 
@@ -75,7 +82,7 @@ def test_respond_reaching_done_sets_result():
     assert session.result.chosen_snacks[0].slot == 3
     assert session.result.chosen_snacks[0].label == "Chips"
     assert session.result.percentages == {"cookies": 10.0, "chips": 90.0}
-    assert session.result.transcript[0] == {"role": "user", "content": "(The guest has just arrived and hasn't said anything yet. Begin: introduce yourself with your usual mixed-up backstory, then ask them to introduce themselves.)"}
+    assert session.result.transcript[0]["role"] == "user"
     assert all(m["role"] != "system" for m in session.result.transcript)
 
 
@@ -128,32 +135,32 @@ def test_intro_does_not_count_toward_the_question_turn_limit():
 
 
 def test_nudge_is_injected_after_turn_threshold_but_not_persisted_to_history():
-    turns = [_not_done(f"Question {i}") for i in range(10)]
+    turns = [_not_done(f"Question {i}") for i in range(14)]
     client = StubDecisionClient(turns)
     session = ConversationSession("s1", client, SNACKS)
     session.start()
 
-    for i in range(4):
+    for i in range(_NUDGE_AFTER_TURNS):
         session.respond(f"answer {i}")
     assert client.calls[-1][-1] != {"role": "system", "content": _WRAP_UP_NUDGE}  # not yet at the threshold
 
-    session.respond("answer 4")  # the 5th respond() call -- turn_count was 4 going in
+    session.respond("answer n")  # the 5th respond() call -- turn_count was 4 going in
     assert client.calls[-1][-1] == {"role": "system", "content": _WRAP_UP_NUDGE}
     # the nudge must never leak into the session's own persisted history
     assert all(m.get("content") != _WRAP_UP_NUDGE for m in session._messages)
 
 
 def test_force_done_passed_once_hard_turn_limit_is_reached():
-    turns = [_not_done(f"Question {i}") for i in range(10)]
+    turns = [_not_done(f"Question {i}") for i in range(14)]
     client = StubDecisionClient(turns)
     session = ConversationSession("s1", client, SNACKS)
     session.start()
 
-    for i in range(6):
+    for i in range(_FORCE_AFTER_TURNS):
         session.respond(f"answer {i}")
     assert client.force_done_flags[-1] is False  # not yet at the hard limit
 
-    session.respond("answer 6")  # the 7th respond() call -- turn_count was 6 going in
+    session.respond("answer n")  # the 7th respond() call -- turn_count was 6 going in
     assert client.force_done_flags[-1] is True
 
 
@@ -161,14 +168,14 @@ def test_forced_reveal_that_still_fails_finalizes_locally_instead_of_looping():
     # +1 for start()'s own turn; then enough not_done turns to cross the hard
     # limit, then a DecisionError on the forced-done attempt itself (e.g. the
     # model said done=true but snack="undecided" even with done locked true).
-    turns = [_not_done(f"Question {i}") for i in range(7)] + [DecisionError("done=true but snack is undecided")]
+    turns = [_not_done(f"Question {i}") for i in range(9)] + [DecisionError("done=true but snack is undecided")]
     client = StubDecisionClient(turns)
     session = ConversationSession("s1", client, SNACKS)
     session.start()
-    for i in range(6):
+    for i in range(_FORCE_AFTER_TURNS):
         session.respond(f"answer {i}")
 
-    reply = session.respond("answer 6")  # the 7th respond() -- force_done=True, and the call itself fails
+    reply = session.respond("answer n")  # the 7th respond() -- force_done=True, and the call itself fails
 
     assert client.force_done_flags[-1] is True
     assert session.done is True
@@ -181,14 +188,14 @@ def test_forced_reveal_that_still_fails_finalizes_locally_instead_of_looping():
 
 def test_force_done_turn_that_comes_back_done_finalizes_normally():
     # +1 for start()'s own turn, which doesn't count toward the question limit
-    turns = [_not_done(f"Question {i}") for i in range(7)] + [_done(snack_ids=("chips",))]
+    turns = [_not_done(f"Question {i}") for i in range(9)] + [_done(snack_ids=("chips",))]
     client = StubDecisionClient(turns)
     session = ConversationSession("s1", client, SNACKS)
     session.start()
-    for i in range(6):
+    for i in range(_FORCE_AFTER_TURNS):
         session.respond(f"answer {i}")
 
-    reply = session.respond("answer 6")
+    reply = session.respond("answer n")
 
     assert client.force_done_flags[-1] is True
     assert session.done is True

@@ -1,0 +1,79 @@
+{
+  "session_id": "02ab6358-514b-4739-8f42-e92e7a7abd97",
+  "chosen_snacks": [
+    {
+      "id": "pretzels",
+      "slot": 3,
+      "label": "pretzels"
+    },
+    {
+      "id": "goldfish",
+      "slot": 3,
+      "label": "goldfish"
+    }
+  ],
+  "percentages": {
+    "m&ms": 0.0,
+    "popcorn": 0.0,
+    "pretzels": 70.0,
+    "goldfish": 65.0
+  },
+  "transcript": [
+    {
+      "role": "user",
+      "content": "(The guest has just arrived and hasn't said anything yet. Begin with your INTRO step: one short sentence introducing yourself with a froggy sound, a quick hint of what you'll do together, and ask their name. Do not mention snacks.)"
+    },
+    {
+      "role": "assistant",
+      "content": "Ribbit. I am Tubi the frog. I'll ask quick either/or questions, then pick a snack. What's your name?"
+    },
+    {
+      "role": "user",
+      "content": "Hmm."
+    },
+    {
+      "role": "assistant",
+      "content": "Alright, quick question. cats or dogs?"
+    },
+    {
+      "role": "user",
+      "content": "Thanks."
+    },
+    {
+      "role": "assistant",
+      "content": "Alright, quick question. cats or dogs?"
+    },
+    {
+      "role": "user",
+      "content": "dog's use"
+    },
+    {
+      "role": "assistant",
+      "content": "Dogs it is. okay, quick question. thrill ride or lazy river?"
+    },
+    {
+      "role": "user",
+      "content": "Crazy river"
+    },
+    {
+      "role": "assistant",
+      "content": "Crazy river, got it. alright, next: adventure or comfort?"
+    },
+    {
+      "role": "user",
+      "content": "\ud558\ubbf8\uc57c, \uc544 \ub108\ubb34 \uc544\ub9de\uc544."
+    },
+    {
+      "role": "assistant",
+      "content": "Hmm, okay. adventure or comfort?"
+    },
+    {
+      "role": "user",
+      "content": "Adventure"
+    },
+    {
+      "role": "assistant",
+      "content": "Okay, you're a pretzels and goldfish person. Done."
+    }
+  ]
+}

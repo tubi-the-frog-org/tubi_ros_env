@@ -31,13 +31,14 @@ import aiohttp
 from pi_app.audio_player import AudioPlayer
 from pi_app.conversation_session import ConversationSession, QuizResult
 from pi_app.decision_client import DecisionClient
-from pi_app.esp32_link import EspLink
+from pi_app.esp32_link import EspLink, estimate_audio_seconds, word_durations_ms
 from pi_app.request_budget import CharacterBudget, RequestBudget
 from pi_app.snacks import SnacksStore
 from pi_app.tts_client import TtsClient, TtsError
 
 RECONNECT_DELAY_S = 3.0
 DISPENSE_OPEN_SECONDS = 4.0
+SLOT_SETTLE_SECONDS = 3.0  # time for the lazy susan to reach its bin before the door opens
 QUIZ_RESULT_PATH = "tools/quiz_result.json"
 _BUDGET_EXHAUSTED_REPLY = "The mists are resting a moment... try again shortly, traveler."
 
@@ -55,6 +56,7 @@ class TeammateClient:
         snacks_store: SnacksStore,
         reconnect_delay_s: float = RECONNECT_DELAY_S,
         dispense_open_seconds: float = DISPENSE_OPEN_SECONDS,
+        slot_settle_seconds: float = SLOT_SETTLE_SECONDS,
         quiz_result_path: str = QUIZ_RESULT_PATH,
         logger: logging.Logger | None = None,
     ):
@@ -68,6 +70,7 @@ class TeammateClient:
         self._snacks_store = snacks_store
         self._reconnect_delay_s = reconnect_delay_s
         self._dispense_open_seconds = dispense_open_seconds
+        self._slot_settle_seconds = slot_settle_seconds
         self._quiz_result_path = quiz_result_path
         self._logger = logger or logging.getLogger(__name__)
         self._session: ConversationSession | None = None
@@ -156,6 +159,10 @@ class TeammateClient:
 
         if audio:
             await ws.send_json({"type": "state", "payload": {"speaking": True}})
+            # The ESP32 runs the head/arm animation on its own from the
+            # per-word schedule, so this just kicks it off alongside playback.
+            word_ms = word_durations_ms(text, estimate_audio_seconds(audio))
+            await loop.run_in_executor(None, self._esp32_link.talk, word_ms)
             await loop.run_in_executor(None, self._audio_player.play, audio)
             await ws.send_json({"type": "state", "payload": {"speaking": False}})
 
@@ -174,6 +181,10 @@ class TeammateClient:
         # pulses it open then closed once, regardless of how many snacks
         # were chosen digitally (the firmware can't dispense more than one).
         loop = asyncio.get_running_loop()
+        slot = result.chosen_snacks[0].slot
+        if 1 <= slot <= 4:
+            await loop.run_in_executor(None, self._esp32_link.set_slot, slot)
+            await asyncio.sleep(self._slot_settle_seconds)
         await loop.run_in_executor(None, self._esp32_link.open_trap_door)
         await asyncio.sleep(self._dispense_open_seconds)
         await loop.run_in_executor(None, self._esp32_link.close_trap_door)

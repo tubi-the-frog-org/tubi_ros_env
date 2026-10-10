@@ -26,7 +26,7 @@ def main():
     load_secrets_env()
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--audio", default="config/max.mp3", help="path to a local audio sample of the voice to clone")
+    parser.add_argument("--audio", default="config/tubi.mp3", help="path to a local audio sample of the voice to clone")
     parser.add_argument("--name", default="Tubi", help="name for the cloned voice on ElevenLabs")
     args = parser.parse_args()
 

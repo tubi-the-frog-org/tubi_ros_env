@@ -37,6 +37,14 @@ class RecordingEspLink:
     def __init__(self):
         self.opened = 0
         self.closed = 0
+        self.slots = []
+        self.talks = []
+
+    def set_slot(self, slot):
+        self.slots.append(slot)
+
+    def talk(self, word_ms):
+        self.talks.append(word_ms)
 
     def open_trap_door(self):
         self.opened += 1
@@ -106,6 +114,7 @@ def _client(snacks_store, turns, result_path, esp32_link=None, audio_player=None
         audio_player or RecordingAudioPlayer(),
         snacks_store,
         dispense_open_seconds=0,
+        slot_settle_seconds=0,
         quiz_result_path=str(result_path),
     )
     return client, decision_client

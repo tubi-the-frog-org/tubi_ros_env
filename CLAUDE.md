@@ -91,6 +91,13 @@ code/decisions that look like they contradict each other:
      dictionary object" instead of being treated as absent — an explicit `labels={}` works around it. A real
      cloned voice now exists and is wired in and verified producing audio.
 
+7. **Firmware grew to 4 servos + a line protocol** (user-requested edit to `esp32_firmware/.../pwm.c`, the one
+   exception to the "don't touch esp32_firmware" rule). Head/arm/lazy susan/trap door each have an MCPWM channel;
+   commands are text lines (`bin 3`, `door open`, `talk <ms per word...>`, plus a `test` mode with raw angles) —
+   the old single-byte `b'1'`/`b'2'` protocol in History #4 and `esp32_link.py` is gone. Per-word timings in
+   `talk` are an estimate (audio bytes / 16000 B/s, split by word length). Pose angles in `pwm.c` are
+   placeholders until tuned in test mode.
+
 ## Measured facts about the Pi (do not assume otherwise)
 - Raspberry Pi 3, 905 MiB RAM, aarch64, Raspberry Pi OS (Debian trixie), hostname `max`, user `maxwelllokshin`,
   internet only via a phone hotspot (can drop — see Risks; offline behavior is explicitly NOT a goal anymore).

@@ -27,3 +27,9 @@ safe to delete any time.
 This container is for Mac-side development only. Deployment to the Raspberry
 Pi uses native ROS 2 Jazzy packages (not this Docker image) — see Step 0 in
 `CLAUDE.md`.
+
+## Repo layout
+
+- `animatronic_ws/` — the Pi-side ROS 2 workspace (this task's scope).
+- `esp32_firmware/` — PlatformIO project for the ESP32 (servos, later audio
+  playback). Out of scope here; see `esp32_firmware/README.md`.

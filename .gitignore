@@ -1,13 +1,9 @@
-animatronic_ws/build/
-animatronic_ws/install/
-animatronic_ws/log/
-
 # PlatformIO build artifacts
 esp32_firmware/.pio/
 
-# TTS audio cache (regenerate with tools/pregenerate.py)
-**/audio_cache/
-
-secrets.env
+pi_app/.venv/
+.pytest_cache/
 __pycache__/
 *.pyc
+
+secrets.env

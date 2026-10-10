@@ -1,0 +1,14 @@
+services:
+  dev:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile
+    image: animatronic-dev:jazzy
+    volumes:
+      - .:/workspace
+    working_dir: /workspace/animatronic_ws
+    stdin_open: true
+    tty: true
+    ports:
+      - "8080:8080"
+    command: sleep infinity

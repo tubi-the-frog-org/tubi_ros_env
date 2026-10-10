@@ -1,0 +1,10 @@
+animatronic_ws/build/
+animatronic_ws/install/
+animatronic_ws/log/
+
+# TTS audio cache (regenerate with tools/pregenerate.py)
+**/audio_cache/
+
+secrets.env
+__pycache__/
+*.pyc

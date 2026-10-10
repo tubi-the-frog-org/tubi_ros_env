@@ -27,7 +27,8 @@ and fill in real keys) — no need to `export` them by hand.
 
 ```sh
 cd pi_app
-.venv/bin/pip install -r tools/requirements-mic.txt   # one-time; not in requirements.txt
+# one-time; not in requirements.txt
+.venv/bin/pip install -r tools/requirements-mic.txt
 .venv/bin/python -m tools.talk_to_tubi
 ```
 
@@ -56,8 +57,10 @@ immediately). Use `--json-file some.json` with `{"text": "..."}` instead of
 cd pi_app
 export LLM_API_KEY=...
 export TTS_API_KEY=...
-export WEBSITE_WS_URL=ws://localhost:3000   # the teammate's website
-export ESP32_SERIAL_PORT=/dev/ttyUSB0       # omit to run with no ESP32 attached
+# the teammate's website
+export WEBSITE_WS_URL=ws://localhost:3000
+# omit this one to run with no ESP32 attached
+export ESP32_SERIAL_PORT=/dev/ttyUSB0
 .venv/bin/python -m pi_app.teammate_client
 ```
 

@@ -200,11 +200,25 @@ def test_converse_done_reply_not_mentioning_snack_raises():
             client.converse(_history(), SNACKS)
 
 
-def test_converse_not_done_long_reply_raises():
-    with FakeDecisionServer(responses=[{"status": 200, "content": _not_done_content(reply="x" * 400)}]) as server:
+def test_converse_not_done_overlong_reply_is_truncated_not_discarded():
+    # A real model exceeded the cap on the very first (intro) turn in practice;
+    # discarding the whole turn meant the conversation never advanced. Truncate instead.
+    with FakeDecisionServer(responses=[{"status": 200, "content": _not_done_content(reply="word " * 200)}]) as server:
         client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
-        with pytest.raises(DecisionValidationError):
-            client.converse(_history(), SNACKS)
+        turn = client.converse(_history(), SNACKS)
+        assert turn.done is False
+        assert len(turn.reply_text) <= 500
+        assert turn.reply_text  # not empty
+
+
+def test_converse_not_done_truncates_at_sentence_boundary_when_possible():
+    long_reply = ("Greetings, traveler! " * 20) + ("Extra padding with no clean break here" * 20)
+    with FakeDecisionServer(responses=[{"status": 200, "content": _not_done_content(reply=long_reply)}]) as server:
+        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
+        turn = client.converse(_history(), SNACKS)
+        # should cut at the last "! " sentence boundary, not mid-word into the padding
+        assert turn.reply_text.endswith("traveler!")
+        assert len(turn.reply_text) <= 500
 
 
 def test_converse_empty_reply_raises():

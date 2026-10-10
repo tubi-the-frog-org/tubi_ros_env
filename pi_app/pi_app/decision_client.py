@@ -27,7 +27,10 @@ from pi_app.snacks import Snack
 
 _URL_RE = re.compile(r"https?://|www\.", flags=re.IGNORECASE)
 _MAX_REPLY_CHARS = 160
-_MAX_CONVERSATION_REPLY_CHARS = 300
+# Generous on purpose -- a theatrical self-intro + a deliberate flub + asking
+# the guest to introduce themselves routinely runs past a tight cap. This is
+# a truncation point, not a hard content rule, unlike _MAX_REPLY_CHARS.
+_MAX_CONVERSATION_REPLY_CHARS = 500
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 _UNDECIDED = "undecided"
 
@@ -255,8 +258,12 @@ class DecisionClient:
             raise DecisionValidationError("reply contains a URL")
 
         if not done:
-            if len(reply) > _MAX_CONVERSATION_REPLY_CHARS:
-                raise DecisionValidationError(f"reply exceeds {_MAX_CONVERSATION_REPLY_CHARS} chars")
+            # Truncate rather than discard: rejecting the whole turn here would
+            # mean the conversation never advances past this point (the guest's
+            # next message gets appended on top of the SAME unanswered history,
+            # which tends to produce an even longer reply next time -- measured
+            # this looping in practice with a real model).
+            reply = _truncate_conversational_reply(reply)
             return ConversationTurn(reply_text=reply, done=False, snack_id=None, percentages=None)
 
         if snack_id not in snack_ids:
@@ -283,3 +290,14 @@ def _normalize_percentages(raw: object, snack_ids: list[str]) -> dict[str, float
     if total <= 0:
         return {sid: 0.0 for sid in snack_ids}
     return {sid: round(v / total * 100, 1) for sid, v in cleaned.items()}
+
+
+def _truncate_conversational_reply(reply: str, limit: int = _MAX_CONVERSATION_REPLY_CHARS) -> str:
+    if len(reply) <= limit:
+        return reply
+    truncated = reply[:limit]
+    cut = max(truncated.rfind(". "), truncated.rfind("! "), truncated.rfind("? "))
+    if cut > limit // 2:  # only prefer the sentence boundary if it doesn't throw away too much
+        return truncated[: cut + 1]
+    last_space = truncated.rfind(" ")
+    return truncated[:last_space] if last_space > 0 else truncated

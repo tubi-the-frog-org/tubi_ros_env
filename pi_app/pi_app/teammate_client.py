@@ -210,7 +210,7 @@ def main():
     esp32_port = os.environ.get("ESP32_SERIAL_PORT") # opening the port
     esp32_link = SerialEspLink(esp32_port) if esp32_port else NullEspLink() # link the serial port of esp
 
-    client = TeammateClient(
+    client = TeammateClient( # this is the conversational part
         ws_url=os.environ.get("WEBSITE_WS_URL", "ws://localhost:3000"),
         decision_client=decision_client,
         tts_client=tts_client,

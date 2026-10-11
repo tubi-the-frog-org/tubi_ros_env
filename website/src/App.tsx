@@ -52,7 +52,6 @@ function App() {
   const [isCalibrating, setIsCalibrating] = useState(false);
   const [isSimulatedBusy, setIsSimulatedBusy] = useState(false);
   const [isSocketConnected, setIsSocketConnected] = useState(false);
-  const [tubiBusy, setTubiBusy] = useState(false);
   const socketRef = useRef<WebSocket | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
@@ -153,10 +152,6 @@ function App() {
           setSessionState('busy');
           setStatus('Another customer is already using Tubi.');
         }
-      }
-
-      if (msg.type === 'tubi-state') {
-        setTubiBusy(Boolean(msg.payload?.busy));
       }
 
       if (msg.type === 'display') {
@@ -471,11 +466,7 @@ function App() {
     }
   };
 
-  const isTubiTurn = sessionState === 'active' && tubiBusy;
-
-  const orbText = isTubiTurn
-    ? 'Tubi'
-    : isCalibrating
+  const orbText = isCalibrating
     ? 'Quiet'
     : isRecording
       ? 'Listening'
@@ -510,9 +501,7 @@ function App() {
           <button
             className={`crystal-control state-${sessionState} ${isRecording ? 'is-recording' : ''} ${isCalibrating ? 'is-calibrating' : ''}`}
             type="button"
-            aria-label={isTubiTurn
-              ? 'Tubi is speaking'
-              : sessionState === 'idle'
+            aria-label={sessionState === 'idle'
               ? 'Awaken Tubi'
               : sessionState === 'busy'
                 ? 'Tubi is busy'
@@ -521,12 +510,12 @@ function App() {
                   : isRecording
                     ? 'Listening, release to send'
                     : 'Press and hold to speak'}
-            disabled={sessionState === 'busy' || isTubiTurn}
+            disabled={sessionState === 'busy'}
             onClick={() => {
               if (sessionState === 'idle') void startSession();
             }}
             onPointerDown={(event) => {
-              if (sessionState !== 'active' || tubiBusy) return;
+              if (sessionState !== 'active') return;
               event.currentTarget.setPointerCapture(event.pointerId);
               void startRecording();
             }}
@@ -548,9 +537,7 @@ function App() {
             </span>
           </button>
           <p className="crystal-hint">
-            {isTubiTurn
-              ? 'Tubi is speaking... wait for your turn'
-              : isCalibrating
+            {isCalibrating
               ? 'Stay quiet for a moment'
               : isRecording
                 ? 'Release when you are finished'

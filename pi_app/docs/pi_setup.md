@@ -66,8 +66,9 @@ Edit the `User=` / paths in the units if the repo isn't at `/home/maxwelllokshin
 ## Things to verify on real hardware
 
 1. **STT latency/cost:** each press-and-hold is one cloud call; time a turn end to end.
-2. The talk button is disabled while Tubi thinks/speaks (server-enforced: `/api/transcribe` returns 409 and
-   the browser gets `tubi-state`). It unlocks when pi_app sends `state speaking:false`, when pi_app disconnects,
-   or after `TUBI_TURN_TIMEOUT_MS` (60 s).
+2. The guest can talk over Tubi: the talk button is never locked. The brain keeps listening during playback and
+   merges anything said mid-turn into one reply after Tubi finishes (it does not cut him off; the ESP32 audio
+   firmware has no stop command). The phone's mic can pick up Tubi's own voice from the speaker, so keep
+   press-and-hold (not open mic).
 3. Audio plays from a speaker on the **Pi** (mpg123). The ESP32 firmware currently has no audio code.
 4. `journalctl -u tubi-brain` shows LLM/TTS errors; budget caps are `LLM_DAILY_REQUEST_CAP` / `TTS_DAILY_CHAR_CAP`.

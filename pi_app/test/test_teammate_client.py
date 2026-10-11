@@ -231,8 +231,7 @@ async def test_character_budget_exhausted_skips_audio(snacks_store, tmp_path):
     await client.handle_message(ws, json.dumps({"type": "session:start", "payload": {}}))
 
     assert audio_player.played == []
-    states = [m["payload"]["speaking"] for m in ws.sent if m["type"] == "state"]
-    assert states == [False]  # turn-over signal still sent so the website unlocks the talk button
+    assert not any(m["type"] == "state" for m in ws.sent)  # no tubi/speaking state anymore
 
 
 async def test_real_websocket_roundtrip(snacks_store, tmp_path):
@@ -264,3 +263,44 @@ async def test_real_websocket_roundtrip(snacks_store, tmp_path):
         assert received_from_client[0] == {"type": "speak", "payload": {"text": "Greetings!"}}
     finally:
         await server.close()
+
+
+class SlowAudioPlayer:
+    """Playback that takes a moment, so the guest can talk over it."""
+
+    def __init__(self):
+        self.played = []
+
+    def play(self, audio_mp3):
+        import time
+        self.played.append(audio_mp3)
+        time.sleep(0.3)
+
+
+async def test_guest_talking_over_tubi_is_heard_and_merged_into_one_turn(snacks_store, tmp_path):
+    client, decision_client = _client(
+        snacks_store, [_not_done("Intro."), _not_done("First reply."), _not_done("Merged reply.")],
+        tmp_path / "result.json", audio_player=SlowAudioPlayer(),
+    )
+    ws = FakeWs()
+    await client.handle_message(ws, json.dumps({"type": "session:start", "payload": {"sessionId": "s1"}}))
+    seen = []
+    real_converse = decision_client.converse
+
+    def spy(messages, snacks, force_done=False):
+        seen.append(messages[-1]["content"])
+        return real_converse(messages, snacks, force_done)
+
+    decision_client.converse = spy
+
+    # First answer starts a turn whose playback is slow; two more arrive while Tubi is still talking.
+    send = lambda text: client.handle_message(ws, json.dumps({"type": "transcript", "payload": {"text": text}}))
+    first = asyncio.create_task(send("My name is Dave"))
+    await asyncio.sleep(0.15)
+    second = asyncio.create_task(send("and I like"))
+    third = asyncio.create_task(send("secret doors"))
+    await asyncio.gather(first, second, third)
+
+    assert seen == ["My name is Dave", "and I like secret doors"]  # two turns, not three
+    assert [m["payload"]["text"] for m in ws.sent if m["type"] == "speak"] == ["Intro.", "First reply.", "Merged reply."]
+    assert not any(m["type"] == "state" for m in ws.sent)

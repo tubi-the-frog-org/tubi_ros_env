@@ -68,6 +68,13 @@ class TeammateClient:
         self._quiz_result_path = quiz_result_path
         self._logger = logger or logging.getLogger(__name__)
         self._session: ConversationSession | None = None
+        # The guest may talk over Tubi: messages are handled in their own tasks
+        # so the socket keeps being read during playback. One turn runs at a
+        # time (the lock); anything said while a turn is in flight waits in
+        # _pending and is merged into a single next turn.
+        self._turn_lock = asyncio.Lock()
+        self._pending: list[str] = []
+        self._tasks: set[asyncio.Task] = set()
 
     async def run_forever(self):
         async with aiohttp.ClientSession() as session:
@@ -81,11 +88,26 @@ class TeammateClient:
     async def _connect_and_listen(self, session: aiohttp.ClientSession):
         async with session.ws_connect(self._ws_url) as ws:
             self._logger.info(f"connected to {self._ws_url}")
-            async for msg in ws:
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    await self.handle_message(ws, msg.data)
-                elif msg.type == aiohttp.WSMsgType.ERROR:
-                    break
+            try:
+                async for msg in ws:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        self._spawn(self.handle_message(ws, msg.data))
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        break
+            finally:
+                for task in list(self._tasks):
+                    task.cancel()
+                self._pending.clear()
+
+    def _spawn(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._task_done)
+
+    def _task_done(self, task: asyncio.Task) -> None:
+        self._tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            self._logger.error("message handler failed", exc_info=task.exception())
 
     async def handle_message(self, ws, raw: str):
         try:
@@ -99,13 +121,16 @@ class TeammateClient:
         if msg_type == "session:start":
             session_id = payload.get("sessionId") or str(uuid.uuid4())
             self._logger.info(f"session:start {session_id}")
-            self._session = ConversationSession(session_id, self._decision_client, self._snacks_store.current)
-            reply = await self._run_llm(self._session.start)
-            await self._speak_turn(ws, reply)
+            self._pending.clear()
+            async with self._turn_lock:
+                self._session = ConversationSession(session_id, self._decision_client, self._snacks_store.current)
+                reply = await self._run_llm(self._session.start)
+                await self._speak_turn(ws, reply)
             return
 
         if msg_type == "session:end":
             self._logger.info("session:end")
+            self._pending.clear()
             self._session = None
             return
 
@@ -120,14 +145,24 @@ class TeammateClient:
         if not text or not text.strip():
             return
 
-        self._logger.info(f"guest said: {text!r}")
-        session = self._session
-        reply = await self._run_llm(lambda: session.respond(text))
-        await self._speak_turn(ws, reply)
+        self._pending.append(text.strip())
+        async with self._turn_lock:
+            if not self._pending:
+                return  # an earlier turn already merged this one in
+            text = " ".join(self._pending)
+            self._pending.clear()
 
-        if session.done:
-            await self._reveal(ws, session.result)
-            self._session = None
+            session = self._session
+            if session is None:  # session ended while this waited its turn
+                return
+
+            self._logger.info(f"guest said: {text!r}")
+            reply = await self._run_llm(lambda: session.respond(text))
+            await self._speak_turn(ws, reply)
+
+            if session.done:
+                await self._reveal(ws, session.result)
+                self._session = None
 
     async def _run_llm(self, fn) -> str:
         if not self._request_budget.try_consume():
@@ -144,15 +179,7 @@ class TeammateClient:
     async def _speak_turn(self, ws, text: str):
         self._logger.info(f"Tubi says: {text!r}")
         await ws.send_json({"type": "speak", "payload": {"text": text}})
-        try:
-            await self._synthesize_and_play(ws, text)
-        finally:
-            # Always tell the website the turn is over (even with no audio:
-            # budget exhausted, TTS failure) -- it keeps the guest's talk
-            # button disabled until it hears this.
-            await ws.send_json({"type": "state", "payload": {"speaking": False}})
 
-    async def _synthesize_and_play(self, ws, text: str):
         loop = asyncio.get_running_loop()
         audio = None
         if self._character_budget.try_consume(len(text)):
@@ -164,7 +191,6 @@ class TeammateClient:
             self._logger.warning("TTS character budget exhausted, sending text only")
 
         if audio:
-            await ws.send_json({"type": "state", "payload": {"speaking": True}})
             # The ESP32 runs the head/arm animation on its own from the
             # per-word schedule, so this just kicks it off alongside playback.
             word_ms = word_durations_ms(

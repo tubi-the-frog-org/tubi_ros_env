@@ -122,32 +122,9 @@ const toTeammate = (type, payload = {}) => {
   }
 };
 
-// Guests may not talk while Tubi is thinking or speaking. Set when a turn is
-// handed to the Pi, cleared when the Pi reports it finished ({"type":"state",
-// "payload":{"speaking":false}}), the Pi disconnects, the session ends, or
-// the safety timeout fires (so a crashed turn can never lock the guest out).
-const TUBI_TURN_TIMEOUT_MS = Number(process.env.TUBI_TURN_TIMEOUT_MS) || 60_000;
-let tubiBusy = false;
-let tubiBusyTimer = null;
-
-const teammateConnected = () =>
-  [...wss.clients].some((client) => client.readyState === 1 && client.role === 'teammate');
-
-const setTubiBusy = (busy) => {
-  clearTimeout(tubiBusyTimer);
-  if (busy) {
-    tubiBusyTimer = setTimeout(() => setTubiBusy(false), TUBI_TURN_TIMEOUT_MS);
-    tubiBusyTimer.unref();
-  }
-  if (busy === tubiBusy) return;
-  tubiBusy = busy;
-  broadcast('tubi-state', { busy });
-};
-
 const finishSession = () => {
   resetTranscriptFile();
   toTeammate('session:end');
-  setTubiBusy(false);
 };
 
 const publishState = () => {
@@ -186,7 +163,6 @@ app.post('/api/session/start', (_, res) => {
 
   resetTranscriptFile();
   toTeammate('session:start', { sessionId: session.sessionId });
-  if (teammateConnected()) setTubiBusy(true);
   publishState();
   res.json({ ok: true, ...session, status: 'active' });
 });
@@ -281,9 +257,6 @@ app.post('/api/transcribe', async (req, res) => {
     if (!sessionLock.heartbeat(req.body?.sessionId)) {
       return res.status(409).json({ ok: false, error: 'active session required' });
     }
-    if (tubiBusy) {
-      return res.status(409).json({ ok: false, error: 'Tubi is speaking', tubiBusy: true });
-    }
 
     if (!req.body || (typeof req.body === 'object' && Object.keys(req.body).length === 0)) {
       return res.status(400).json({ ok: false, error: 'missing audio payload' });
@@ -330,7 +303,6 @@ app.post('/api/transcribe', async (req, res) => {
     // system prompt knows to answer with "what was that?" instead of leaving the
     // guest in dead air with a locked-out button.
     if (!STT_FAILURE_TEXT.test(result.text ?? '')) {
-      if (teammateConnected()) setTubiBusy(true);
       toTeammate('transcript', { text: result.text || NO_SPEECH_MARKER, isFinal: true, timestamp: Date.now() });
     }
     res.json({ ok: true, text });
@@ -363,19 +335,9 @@ wss.on('connection', (socket, req) => {
   const role = new URL(req.url ?? '/', 'http://localhost').searchParams.get('role');
   socket.role = role === 'teammate' ? 'teammate' : 'browser';
   socket.send(JSON.stringify({ type: 'session-state', payload: sessionLock.snapshot() }));
-  socket.send(JSON.stringify({ type: 'tubi-state', payload: { busy: tubiBusy } }));
-  socket.on('close', () => {
-    if (socket.role === 'teammate' && !teammateConnected()) setTubiBusy(false);
-  });
-
   socket.on('message', (raw) => {
     try {
       const data = JSON.parse(raw.toString());
-
-      if (socket.role === 'teammate' && data.type === 'state' && data.payload?.speaking === false) {
-        setTubiBusy(false);
-        return;
-      }
 
       if (data.type === 'transcript') {
         broadcast('transcript', { text: data.payload?.text ?? '' });

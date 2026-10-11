@@ -28,7 +28,7 @@ import uuid
 
 import aiohttp
 
-from pi_app.audio_player import AudioPlayer
+from pi_app.audio_player import AudioPlayer, Esp32AudioPlayer
 from pi_app.conversation_session import ConversationSession, QuizResult
 from pi_app.decision_client import DecisionClient
 from pi_app.esp32_link import EspLink, estimate_audio_seconds, word_durations_ms
@@ -167,7 +167,9 @@ class TeammateClient:
             await ws.send_json({"type": "state", "payload": {"speaking": True}})
             # The ESP32 runs the head/arm animation on its own from the
             # per-word schedule, so this just kicks it off alongside playback.
-            word_ms = word_durations_ms(text, estimate_audio_seconds(audio))
+            word_ms = word_durations_ms(
+                text, estimate_audio_seconds(audio, self._tts_client.bytes_per_second)
+            )
             await loop.run_in_executor(None, self._esp32_link.talk, word_ms)
             await loop.run_in_executor(None, self._audio_player.play, audio)
 
@@ -217,11 +219,20 @@ def main():
         model=os.environ.get("LLM_MODEL", "gpt-5-nano"),
         api_key=os.environ.get("LLM_API_KEY", ""),
     )
+    audio_port = os.environ.get("AUDIO_SERIAL_PORT")
     tts_client = TtsClient( # cloud based llm we are using for text to speech
         base_url=os.environ.get("TTS_BASE_URL", "https://api.elevenlabs.io/v1"),
         model=os.environ.get("TTS_MODEL", "eleven_turbo_v2_5"),
         api_key=os.environ.get("TTS_API_KEY", ""),
         voice_id=os.environ.get("TTS_VOICE_ID", "pNInz6obpgDQGcFmaJgB"),
+        # The ESP32 audio firmware only plays 22.05 kHz mp3.
+        output_format=os.environ.get("TTS_OUTPUT_FORMAT") or ("mp3_22050_32" if audio_port else None),
+    )
+
+    # Speech goes to the ESP32's DAC when AUDIO_SERIAL_PORT is set, else out of the Pi's own speaker.
+    audio_player = (
+        Esp32AudioPlayer(audio_port, bytes_per_second=tts_client.bytes_per_second)
+        if audio_port else AudioPlayer()
     )
 
     esp32_port = os.environ.get("ESP32_SERIAL_PORT") # opening the port
@@ -234,7 +245,7 @@ def main():
         request_budget=RequestBudget(daily_limit=int(os.environ.get("LLM_DAILY_REQUEST_CAP", "300"))),
         character_budget=CharacterBudget(daily_limit=int(os.environ.get("TTS_DAILY_CHAR_CAP", "20000"))),
         esp32_link=esp32_link,
-        audio_player=AudioPlayer(),
+        audio_player=audio_player,
         snacks_store=snacks_store,
     )
     asyncio.run(client.run_forever())

@@ -22,8 +22,8 @@ MP3_BYTES_PER_SECOND = 16000
 MIN_WORD_MS = 120
 
 
-def estimate_audio_seconds(audio_mp3: bytes) -> float:
-    return len(audio_mp3) / MP3_BYTES_PER_SECOND
+def estimate_audio_seconds(audio_mp3: bytes, bytes_per_second: int = MP3_BYTES_PER_SECOND) -> float:
+    return len(audio_mp3) / bytes_per_second
 
 
 def word_durations_ms(text: str, audio_seconds: float) -> list[int]:

@@ -24,6 +24,8 @@ class StubDecisionClient:
 
 
 class StubTtsClient:
+    bytes_per_second = 16000
+
     def __init__(self, result=b"mp3-bytes"):
         self.result = result
         self.calls = []

@@ -40,6 +40,7 @@ class TtsClient:
         similarity_boost: float = 0.6,
         timeout_s: float = 10.0,
         session: requests.Session | None = None,
+        output_format: str | None = None,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -49,6 +50,9 @@ class TtsClient:
         self.similarity_boost = similarity_boost
         self.timeout_s = timeout_s
         self._session = session or requests.Session()
+        # ElevenLabs query param, e.g. "mp3_22050_32". The ESP32 audio firmware
+        # plays at a fixed 22050 Hz, so the mp3 it receives must be 22.05 kHz.
+        self.output_format = output_format
 
     def synthesize(self, text: str) -> bytes:
         """Returns MP3 bytes, or raises a TtsError subtype."""
@@ -70,6 +74,7 @@ class TtsClient:
                 f"{self.base_url}/text-to-speech/{self.voice_id}",
                 json=payload,
                 headers=headers,
+                params={"output_format": self.output_format} if self.output_format else None,
                 timeout=self.timeout_s,
             )
         except requests.exceptions.Timeout as e:
@@ -81,3 +86,11 @@ class TtsClient:
             raise TtsRequestError(f"TTS call returned HTTP {resp.status_code}: {resp.text[:200]}")
 
         return resp.content
+
+    @property
+    def bytes_per_second(self) -> int:
+        """Audio bytes per second of speech for the configured mp3 format."""
+        parts = (self.output_format or "").split("_")  # mp3_<hz>_<kbps>
+        if len(parts) == 3 and parts[0] == "mp3" and parts[2].isdigit():
+            return int(parts[2]) * 125
+        return 16000  # ElevenLabs default: mp3_44100_128

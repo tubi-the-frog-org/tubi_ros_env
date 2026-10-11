@@ -1,20 +1,19 @@
-# Project: Wizard snack animatronic — Pi-side service
+# Project: Tubi the Wizard Frog — magic-user assessment
 
 ## What we're building
-A voice-quiz animatronic, hackathon team project ("Tubi the Wizard Frog"). A teammate's website (phone-first,
-mic capture + browser speech-to-text, in `website/`) sends the guest's transcribed text over a WebSocket. This
-Pi-side service (`pi_app/`) is "the teammate system" on the other end of that socket: it picks a snack, writes
-and voices the spoken reply via two cloud calls, plays the audio out of a speaker wired to the Pi, and pulses an
-ESP32 (firmware in `esp32_firmware/`, built by another teammate) over serial to open/close a trap door. This
-task covers ONLY `pi_app/`. Do not write inside `esp32_firmware/` or `website/` — those are built by teammates;
-treat their contents as a contract to integrate with, not code to edit.
+A voice-conversation animatronic, hackathon team project ("Tubi the Wizard Frog"). A teammate's website
+(`website/`) sends guest transcripts to the Pi service (`pi_app/`) over a WebSocket. Tubi asks personality
+questions, then the AI determines a magic-user type and level and writes Tubi's spoken reply. ElevenLabs
+generates the voice; the Pi plays it and uses the ESP32 for speaking animation. The hardware also retains
+servo and dispenser code, but the AI decision flow does not invoke dispensing. Work here is scoped to
+the Pi-side AI service; the website and ESP32 implementations are teammate-owned unless explicitly authorized.
 
 ## History (why the design looks like this)
 Four real pivots happened while building this, in order — kept here so a reader isn't confused by
 code/decisions that look like they contradict each other:
 1. **Started as a ROS 2 workspace** with a local Ollama LLM (`qwen2.5:0.5b`) as the "brain". Measured on the real
-   Pi: ~2-3 tok/s generation, 8-40 s per call, and the model could not reliably reason "crunchy" -> a snack or
-   write coherent prose. Memory was dominated by Ollama (~600 MB of 905 MiB total).
+  Pi: ~2-3 tok/s generation and 8-40 s per call, and the model could not reliably interpret short guest
+  answers or write coherent prose. Memory was dominated by Ollama (~600 MB of 905 MiB total).
 2. **Replaced Ollama with a cloud LLM** (OpenAI-compatible, structured output) as the primary decision-maker,
    keeping Ollama as an optional off-by-default `local` fallback provider alongside `keyword` and `fallback`,
    inside a ROS 2 node.
@@ -24,11 +23,8 @@ code/decisions that look like they contradict each other:
    everything, including writing the spoken reply itself (no more pre-written lines in the normal path).
 4. **Teammates' real `esp32_firmware/` and `website/` code landed, and both contradicted assumptions made
    without seeing them:**
-   - The ESP32 (`esp32_firmware/src/motor_esp2`, ESP-IDF) reads ONE raw ASCII byte over UART0 at 115200 baud —
-     `b'1'` closes a trap door, `b'2'` opens it. No JSON, no ack, no audio support at all. There's also no
-     per-snack slot routing yet (constants for a rotating tray exist but aren't wired to any input) — so
-     `angle` was dropped from `snacks.json` entirely (the firmware doesn't take one) in favor of a plain `slot`
-     int, carried through for whenever that routing gets built.
+   - The ESP32 (`esp32_firmware/src/motor_esp2`, ESP-IDF) provides servo and dispenser controls over UART.
+     These remain hardware functionality; the current AI assessment does not issue dispense commands.
    - Audio therefore plays out of a speaker wired directly to the Pi, not through the ESP32.
    - The website (`website/`, Node/Express/`ws`) is a WebSocket **broadcast hub**: the browser and this
      teammate system are both just clients of the same socket (see `website/docs/message-contract.md`). This
@@ -36,51 +32,27 @@ code/decisions that look like they contradict each other:
      `POST /speak` server) was wrong and was replaced by `teammate_client.py` (an outbound WS client).
    - TTS moved from OpenAI's `/audio/speech` to ElevenLabs, per a direct ask, as a stepping stone toward a
      cloned custom voice later (ElevenLabs supports voice cloning; OpenAI's TTS voices don't).
-5. **Replaced the one-shot "text in, snack+reply out" shape with a real multi-turn conversation.** Tubi now
-   introduces himself (with a running joke: he always gets one detail of his own backstory comically wrong),
-   asks the guest to introduce themselves, asks a few open-ended personality/feeling questions of his own
-   choosing (terse and direct here, deliberately NOT theatrical — the monologue is reserved for the intro and
-   reveal), then reveals **on his own confidence, not on request** — there's no "are you ready?" gate; the
-   guest never has to ask for or confirm the result, he just decides (by his 2nd-3rd answer, 4th at the
-   latest) and says it, like a friend reading someone's vibe rather than a quiz show waiting to be told to
-   give the answer. The reveal can name **one snack or several** (up to all of them) with an independent 0-100
-   confidence score per snack — NOT a split of 100 across all snacks, since a guest can genuinely score high
-   on more than one at once (e.g. 70% one snack AND 65% another, both true simultaneously). One endpoint, one
-   schema, grown to support this: `{"snacks": [...], "reply", "done", "percentages"}` — `snacks` is a list,
-   not a single id, and empty while `done=false`. `conversation_session.py` owns the growing chat history;
-   `DecisionClient.converse()` is the call. `website/docs/message-contract.md` only documents the old one-shot
-   shape, so `teammate_client.py` now sends a `speak` message per turn and an extended `display` — see
-   `pi_app/docs/multi_turn_contract_proposal.md` for exactly what the website side needs to add to really drive
-   this (not yet built there). `tools/talk_to_tubi.py` exercises the whole conversation locally, by voice, using
-   the dev machine's own microphone + local Whisper STT — no website, ESP32, or Pi needed to test it.
-   A prompt instruction alone ("ask 2-4 questions", "reveal when confident") was measured NOT reliable enough on
-   its own — a real run asked 10+ questions without ever revealing. `ConversationSession` backs this with a
-   code-enforced turn counter: a nudge after 4 turns, a structurally-forced `done=true` after 6 (the schema
-   locks it, not just a prompt request), and a local hard-finalize with no further LLM call if even that
-   fails — a demo must never hang on an uncooperative model.
+5. **Moved from one-shot input to a multi-turn conversation.** Tubi introduces himself, asks the guest's name,
+  and asks a few open-ended personality questions. When ready, he gives a fictional magic-user type and a
+  freely chosen level from 1 to 10; this is not calculated or presented as a real aptitude score. The spoken
+  reveal connects to something the guest actually said. `conversation_session.py` owns chat history and
+  `DecisionClient.converse()` returns the structured fields `reasoning`, `done`, `magic_type`, `magic_level`,
+  and `reply`. `teammate_client.py` speaks each turn and emits a final `magic-assessment` display message.
+  `tools/talk_to_tubi.py` exercises the multi-turn conversation locally using the dev machine's microphone
+  and local Whisper transcription.
 6. **Several rounds of real-voice testing reshaped the system prompt** (`_SYSTEM_PROMPT_TEMPLATE` in
    `decision_client.py`) and added a real cloned voice. In order, each measured against live calls/real mic
    audio, not just reasoned about:
-   - Personality rewrite: Tubi is goofy-but-smart/eccentric (not constantly joking or prophetic), does a quick
-     one-line intro with a froggy sound ("ribbit"/"croak"), then asks simple X-or-Y questions (e.g. "cats or
-     dogs?") one at a time so the guest never has to think hard about an answer. During questions he reacts to
-     the previous answer in very few words before asking the next one, for fluidity — a linked research paper
-     (PMC4981440) that was supposed to ground the question-asking approach could not actually be read (blocked
-     by a reCAPTCHA) and, more fundamentally, can't be read by the model either (no URL fetching in a plain
-     chat completion call) — dropped, the X-or-Y structure stands on its own.
+   - Personality rewrite: Tubi is goofy-but-smart/eccentric, gives a brief in-character intro, asks one
+     whimsical open-ended question per turn, and reacts briefly to each answer.
    - "Ask a few questions" / "reveal when confident" were, again, too soft — tightened to an explicit "at most
-     4 questions, treat a 5th as a mistake." Still not perfectly reliable on its own (real trials: anywhere from
-     exactly 4 to one or two over), which is exactly why the code-enforced cap from pivot #5 still matters as
-     the real backstop.
+    4 questions, treat a 5th as a mistake." The prompt controls question count and reveal timing; there is no
+    code-injected question bank or forced reveal.
    - **Guest answers come from speech-to-text and will often be garbled, mistranscribed, or off-topic** —
      measured a real failure mode where a mistranscribed stray character got taken literally and the model
      hallucinated an entire new unrelated question out of it, derailing the rest of the conversation. The
      prompt now explicitly says answers may be garbled, not to take them literally, and to rephrase or move on
      rather than spiraling.
-   - **Reveals kept naming only 1 snack** even with a healthy spread across percentages (e.g. 85/40/25/20) —
-     "include every snack whose score is genuinely high enough" was too vague and the model defaulted to the
-     single top pick every time. Replaced with a concrete, checkable rule: include every snack scoring >=60.
-     Verified this actually produces 2-3 snack reveals now, matching the original multi-snack intent from #5.
    - **Voice cloning**: `tools/clone_voice.py` (new) is a one-time setup script — NOT something the running
      service ever calls — that uploads a local audio sample (`config/max.mp3`) via the `elevenlabs` SDK
      (`tools/requirements-voice-clone.txt`, kept out of core `requirements.txt` same as the mic tooling) and
@@ -118,28 +90,25 @@ pi_app/teammate_client.py -- connects OUT to the website's WS hub as "the teamma
         |  session:start -> new ConversationSession; transcript -> .respond(); session:end -> clear
         v
 ConversationSession (pi_app/conversation_session.py), one per guest, owns the growing chat history:
-  per turn -> RequestBudget check -> DecisionClient.converse(history, snacks)
-              -> {"done": bool, "snacks": [enum, ...], "reply": string, "percentages": {...}}
-              (snacks is a LIST -- empty while done=false, one or more when done=true; Tubi decides to
-              reveal on his own confidence, there is no "are you ready?" confirmation step)
+  per turn -> RequestBudget check -> DecisionClient.converse(history)
+              -> {"done": bool, "magic_type": string, "magic_level": 1..10, "reply": string}
+              (type and level are empty/zero until Tubi decides to reveal; no confirmation step)
   every turn -> CharacterBudget check -> TtsClient.synthesize(reply) -> mp3 bytes (ElevenLabs)
         |
         +--> every turn: ws.send_json({"type":"speak","payload":{"text":reply}}),
         |    {"type":"state","payload":{"speaking":...}}, AudioPlayer.play(audio) on the Pi's own speaker
-        +--> only on done=true: {"type":"display","payload":{"kind":"result","snacks":[...],"percentages":{...}}},
-             EspLink.open_trap_door()/close_trap_door() ONCE regardless of how many snacks were chosen
-             (single ASCII byte over serial -- only one physical mechanism exists), write the QuizResult
-             JSON to tools/quiz_result.json
+           +--> only on done=true: {"type":"display","payload":{"kind":"magic-assessment","magic_type":...,"magic_level":...}},
+             write the MagicResult JSON to tools/magic_result.json; no dispenser command is sent
 ```
 The guest-facing frontend lives entirely in `website/` (a teammate's). The HTTPS-for-mic-access requirement and
 the website's own hosting choice are that teammate's call per `website/CLAUDE.md` — read it before assuming
-anything about where/how the site runs. The `speak` message and `display`'s `percentages` field are a proposal
-(`pi_app/docs/multi_turn_contract_proposal.md`), not yet implemented on the website side.
+anything about where/how the site runs. The `magic-assessment` display payload is documented in
+`pi_app/docs/multi_turn_contract_proposal.md`; a dedicated website renderer may still be needed.
 
 ### Why two cloud calls, not one combined audio+decision call
 Audio-output chat models' structured-output support is unverified/historically limited, and even where
 supported, the model's *spoken* audio is a rendition of its own response text — there's no clean way to make it
-speak only the mystical reply while also embedding a machine-parseable snack id in that same text without either
+speak only the mystical reply while also embedding machine-readable magic assessment fields in that same text without either
 garbling the spoken line or needing fragile parsing. Two clean calls — a cheap structured-output decision call
 (`gpt-5-nano`), then a dedicated TTS call — is simpler and keeps each call's job single-purpose.
 
@@ -150,87 +119,42 @@ a `synthesize(text) -> bytes` shape regardless, so going from the stock `"Adam"`
 `pNInz6obpgDQGcFmaJgB`) to the cloned one was a one-line config change (`TTS_VOICE_ID` in `secrets.env`), not a
 redesign. `tools/clone_voice.py` is how the clone itself gets created — see `pi_app/` layout below.
 
-## Config: `pi_app/config/snacks.json` (single source of truth, editable when real snacks change)
-Schema (validate on load with clear errors):
-```json
-{
-  "version": 1,
-  "default_snack": "none",
-  "snacks": [
-    {"id":"cookies","label":"Cookies","slot":1,
-     "aliases":["biscuit"],"tags":["sweet","soft","blue","rain"],
-     "lines":[{"id":"cookies_1","text":"Ah, the ancient tides foretell... cookies!"}]},
-    {"id":"none","label":"No snack","slot":0,"aliases":[],"tags":[],
-     "lines":[{"id":"none_1","text":"The spirits are silent... try again, traveler."}]}
-  ]
-}
-```
-- No `angle` field (dropped — see History #4; the ESP32 doesn't take one). `slot` is a plain int, carried
-  through `SnackMessage` for whenever the firmware's per-slot routing gets built.
-- `label`/`tags`/`aliases` are still used (to build the decision call's system prompt, and to validate that its
-  `reply` actually mentions the chosen snack) even though `lines` is no longer used in the normal path — the
-  cloud LLM writes the reply itself now. `lines` stays in the schema/placeholder data as a reference/fallback
-  asset, not because it's required.
-- Hot reload: `SnacksStore` polls file mtime every 2 s. If the new file is invalid, KEEP the old config and log
-  the error. Log a diff of added/removed snacks.
-- Current placeholder data has a real bug worth fixing: two snacks share `slot: 3` (a physical conflict) — not
-  changed here since it's content, not code, but flag it before this goes further.
+## Magic assessment
+The model returns a freeform `magic_type` and integer `magic_level` from 1 to 10. Before the reveal,
+`magic_type` is empty and `magic_level` is 0. The choice is playful, not scored or calculated. Tubi's
+personality, questions, conversation flow, and answer-linked explanation stay in `_SYSTEM_PROMPT_TEMPLATE`.
 
 ## pi_app/ layout
-- `snacks.py` — loader/validator/hot-reload (`SnacksConfig`, `Snack`, `Line`, `SnacksStore`). No dependencies
-  beyond the stdlib.
 - `request_budget.py` — `RequestBudget` (decision calls) and `CharacterBudget` (TTS characters). Both have a
   daily cap and a lifetime cap; `-1` means unlimited.
-- `decision_client.py` — two call shapes against the same OpenAI-compatible endpoint:
-  - `choose_snack_and_reply(text, snacks) -> (snack_id, reply)` — the original one-shot shape. Still used by
-    `decision_service.py`/`tools/try_request.py` for a quick single-question test in isolation.
-  - `converse(messages, snacks, force_done=False) -> ConversationTurn` — the real multi-turn shape, used by
-    `ConversationSession`. Schema adds `done` and `snacks` (a LIST, not a single id, since a guest can match
-    more than one -- see History #5) and `percentages` (independent 0-100 confidence per snack id, clamped but
-    deliberately NOT rescaled to sum to 100 — `_clamp_percentages`, not `_normalize_percentages`).
-    `force_done=True` locks `done`'s schema to literally only accept `true`, used once a conversation has run
-    long (see `ConversationSession`'s question cap below) — a prompt instruction alone wasn't reliably enough.
-  Both: 15 s timeout, one retry only on 429/5xx (`temperature` omitted by default — `gpt-5-nano` 400s on
+- `decision_client.py` — `assess_magic_user(text)` for a one-shot assessment and
+  `converse(messages)` for the multi-turn flow. Structured output contains `magic_type`, `magic_level`,
+  `reply`, and `done` (plus private `reasoning` during conversation). Magic level is validated as an integer
+  from 1 to 10. Both calls use a 15 s timeout and one retry only on 429/5xx (`temperature` omitted by default — `gpt-5-nano` 400s on
   anything but its default of 1; `reasoning_effort` defaults to `"low"`). Reply validation (non-empty, no URL;
-  <=160 chars + must-mention-at-least-one-chosen-snack for a one-shot reply or a `done=true` reveal line, via
-  `validate_reveal_reply` — mention-matching normalizes punctuation first, e.g. label `"m&ms"` still matches a
-  reply naturally written `"M&M's"`; a more lenient length-only cap for intermediate conversational turns,
-  truncated at a sentence/word boundary rather than discarded) — any failure raises `DecisionError`, treated
-  as "say a varied, in-character goofy retry line," never something that reaches the guest as a crash. System
-  prompt frames the guest's text as DATA, never instructions (prompt-injection defense). **Measured with real
-  keys**:
+  a 280-character reveal limit and a 500-character intermediate limit truncated at sentence/word boundaries)
+  — any failure raises `DecisionError`. The system prompt frames guest text as DATA, never instructions.
+  **Measured with real keys**:
   `reasoning_effort` matters a lot for GPT-5-family models — default effort took ~11-20 s/call; `"minimal"`
-  dropped that to ~2 s/call but was unreliable (3/5 trials never actually committed to a snack on reveal,
+  dropped that to ~2 s/call but was unreliable (3/5 trials returned invalid assessment output,
   staying `"undecided"`); `"low"` lands at ~3-8 s/call with 10/11 trials completing successfully. `"low"` is
   the default; `"minimal"` is tempting for speed but measurably trades away correctness on this task.
-- `conversation_session.py` — `ConversationSession`, one per guest: owns the growing chat-history list,
-  `.start()` kicks off Tubi's intro, `.respond(guest_text)` feeds one guest turn and returns Tubi's next line.
-  When a turn comes back `done=true`, `.result` is set to a `QuizResult` (session_id, `chosen_snacks: list[
-  ChosenSnack]` — one or more, each with id/slot/label — percentages, transcript) and further `.respond()`
-  calls raise. On a `DecisionError`, rolls back the just-appended guest turn before returning a varied
-  `_GOOFY_RETRY_REPLIES` line, so a failed call doesn't poison the history the next real call sees.
-  Code-enforced question cap (a prompt instruction alone measured unreliable — a real run asked 10+ questions
-  without ever revealing): a `_turn_count` tracks turns after the intro; past `_NUDGE_AFTER_TURNS` (4), a
-  one-off system reminder is appended to that call only (never persisted to history); past
-  `_FORCE_AFTER_TURNS` (6), `force_done=True` is passed so the schema itself locks `done=true`; if even that
-  call fails (measured: possible — the model can still fail the reveal's content validation), `_finalize_locally()`
-  picks one snack itself with no further LLM call, guaranteeing the session always terminates.
+- `conversation_session.py` — `ConversationSession` owns one guest's growing history. On `done=true`, it stores
+  a `MagicResult` with type, level, and transcript. Decision errors roll back the unanswered guest turn and
+  propagate; the system prompt controls conversation questions and reveal timing.
 - `tts_client.py` — ElevenLabs. `TtsClient.synthesize(text) -> bytes`. `TtsError` subtypes map
   timeout/request/invalid-response failures the same way as the decision client.
 - `audio_player.py` — `AudioPlayer.play(mp3_bytes)`. Shells out to `afplay`/`mpg123`/`ffplay` (whichever is
   found) rather than pulling in a Python audio dependency. Never raises; missing player or playback failure just
   means no audio played, same severity as a TTS failure.
-- `message_package.py` / `decision_service.py` — the older one-shot pipeline (`SnackMessage`,
-  `DecisionService.handle()`). Kept for `tools/try_request.py`'s quick single-question tests; not what drives
-  a real conversation anymore (see `teammate_client.py`/`conversation_session.py`).
-- `esp32_link.py` — `EspLink` interface (`open_trap_door()`/`close_trap_door()`), `NullEspLink` (dev/no
-  hardware), `SerialEspLink` (pyserial, writes a single `b'1'`/`b'2'` byte at 115200 baud — matches the real
-  firmware exactly, see History #4). No per-slot routing yet; `ChosenSnack.slot` is unused here until the
-  firmware grows that, and only one trap door is pulsed regardless of how many snacks were chosen digitally.
+- `message_package.py` / `decision_service.py` — one-shot magic assessment and TTS pipeline used by
+  `tools/try_request.py`.
+- `esp32_link.py` — retained serial interface for speech animation and existing servo/dispenser commands.
+  The magic assessment flow uses talking animation only and never issues a dispense command.
 - `teammate_client.py` — `TeammateClient`, an `aiohttp` WS **client** connecting OUT to `WEBSITE_WS_URL`.
   `session:start` creates a `ConversationSession` and speaks its intro; `transcript` feeds the active session
-  and speaks the reply; on `done`, sends the extended `display` (`snacks: [...]` labels + `percentages`),
-  pulses the trap door once (`DISPENSE_OPEN_SECONDS`), and writes the `QuizResult` to `tools/quiz_result.json`.
+  and speaks the reply; on `done`, sends the magic type/level display message and writes `MagicResult` to
+  `tools/magic_result.json`. It does not call the hardware dispense API.
   Both the decision call and the TTS call are budget-gated per turn (`RequestBudget`/`CharacterBudget`),
   degrading to a fallback line or text-only rather than erroring. Auto-reconnects with a fixed delay on
   disconnect.
@@ -256,12 +180,9 @@ secret itself, but lives in `secrets.env` alongside the keys since it's config, 
 `WEBSITE_WS_URL` and `ESP32_SERIAL_PORT` are plain config too, also env-driven, so nothing is hardcoded.
 
 ## What's missing / still open
-- The `speak` message and `display.percentages` addition (`pi_app/docs/multi_turn_contract_proposal.md`) aren't
-  built on the website side yet — `teammate_client.py` sends them, but nothing there re-arms the mic after each
-  Tubi turn or displays the running conversation. Real end-to-end multi-turn needs that built first.
-- The real per-slot ESP32 routing (firmware only supports one trap door open/close right now, not a snack
-  selector) — `QuizResult.slot` is ready for it, `esp32_link.py` isn't yet.
-- The duplicate `slot: 3` bug in `pi_app/config/snacks.json` (two snacks claim the same physical position).
+- The website may need to render the `magic-assessment` display payload and re-arm the mic after each Tubi turn;
+  see `pi_app/docs/multi_turn_contract_proposal.md`.
+- ESP32 servo and dispenser controls remain available for separate hardware use; the AI flow does not invoke them.
 - `docs/esp32_protocol.md` — never written; the real protocol turned out to be much simpler (one byte) than
   originally planned (JSON + chunked audio), so this may not even be needed unless the protocol grows.
 - A real end-to-end test with live API keys and the actual website + ESP32 — use `tools/talk_to_tubi.py` to test
@@ -272,15 +193,13 @@ secret itself, but lives in `secrets.env` alongside the keys since it's config, 
   assumes Render, which is a different plan than "the Pi hosts it") and the HTTPS tunnel in front of it.
 
 ## Tests
-- Unit: `snacks.json` validation + hot reload, `RequestBudget`/`CharacterBudget` caps, `dotenv.py`'s loader,
-  `DecisionClient` against a fake HTTP server — both `choose_snack_and_reply` (success/invalid snack/bad
-  JSON/429-retry/non-retryable error/timeout/connection refused/content validation) and `converse`
-  (not-done/done/percentage-normalization/invalid-snack/reply-doesn't-mention-snack/too-long/bad-json),
+- Unit: `RequestBudget`/`CharacterBudget` caps, `dotenv.py`'s loader, and `DecisionClient` against a fake HTTP
+  server (magic type/level validation, malformed output, retry, timeout, and conversation turns),
   `TtsClient` against a fake ElevenLabs-shaped server, `DecisionService`'s budget/error/success paths,
   `ConversationSession` against a stub client (history accumulation, reaching done, rollback-on-error,
   raising if you `.respond()` after done), `EspLink` against a fake serial object, `AudioPlayer` against fake
   player commands, `TeammateClient` via direct `handle_message()` calls (session:start/transcript/session:end,
-  budget exhaustion on both budgets, reveal+dispense+file-write) and one real-websocket round-trip test.
+  budget exhaustion on both budgets, magic reveal/file-write without dispensing) and one real-websocket round-trip test.
 - Still needed: a real integration test once the website contract addition and ESP32 are both built;
   `tools/smoke_pi.sh` (checks internet reachability and the env key *names*, never values, plus the serial
   device).
@@ -288,8 +207,7 @@ secret itself, but lives in `secrets.env` alongside the keys since it's config, 
 ## Process
 - Present a short plan first, then build incrementally, committing after each piece with a working test.
 - Ask questions only if blocked. Otherwise choose sensible defaults, state them, and keep going.
-- Finish with a README covering: setup on the Pi, how to swap snacks (edit snacks.json, hot-reloads
-  automatically), how to run tests, and a prioritized list of risks and recommendations.
+- Keep the README current with Pi setup, the magic-assessment flow, tests, and hardware notes.
 
 ## Risks and recommendations (living list)
 - **Total network dependence.** With offline/keyword/local explicitly dropped, there is now NO path that works
@@ -302,8 +220,8 @@ secret itself, but lives in `secrets.env` alongside the keys since it's config, 
 - **Key security.** `LLM_API_KEY`/`TTS_API_KEY` from env/`secrets.env` only, never logged above DEBUG, never sent
   to the browser — the browser only ever talks to the website's own server, never directly to this service.
 - **Prompt injection.** The guest's text reaches the decision LLM as untrusted input; the system prompt frames
-  it as data, and the structured-output schema + reply validation (must be a real snack, must mention it, no
-  URL, length-capped) bound what a successful injection could even produce.
+  it as data, and structured-output validation (magic type, level 1-10, no URL, length-capped) bounds what a
+  successful injection could produce.
 - **No audio pregeneration anymore.** Every reply is freshly LLM-written, so there's no cache hit path — every
   successful request pays a live TTS call's latency and cost, with no way around it now that pre-written lines
   aren't in the normal path.

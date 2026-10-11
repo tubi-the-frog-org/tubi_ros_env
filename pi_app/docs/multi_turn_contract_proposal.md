@@ -26,23 +26,23 @@ treat it the same way it currently treats "Tubi is speaking" — and once speaki
 listening for the guest's next answer (previously only "session end" meant "stop listening"; now the
 browser needs to listen again after every `speak`, until the final `display` result arrives).
 
-## Changed message: the final `display` result can now name more than one snack, plus percentages
+## Changed message: the final `display` result contains the magic-user assessment
 
 ```json
 {
   "type": "display",
   "payload": {
-    "kind": "result",
-    "snacks": ["Chips", "M&Ms"],
-    "percentages": {"chips": 82.0, "m&ms": 78.0, "cookies": 25.0, "popcorn": 13.0}
+    "kind": "magic-assessment",
+    "magic_type": "Stormweaver",
+    "magic_level": 7
   }
 }
 ```
 
-`snacks` is a LIST now, not a single `snack` string — a guest can genuinely match more than one (up
-to all of them), decided by Tubi, not a fixed rule. `percentages` is new too — an independent 0-100
-confidence score per snack, NOT a split of 100 across all snacks (two snacks can both score high at
-once). Both are additive changes to the `display` message shape; nothing else about it changed.
+`magic_type` is a short, imaginative description and `magic_level` is a freely chosen integer from 1 to 10.
+The level is a playful fiction, not a calculated score. The spoken reveal should connect the type or level to
+something the guest said. The existing display message remains an additive event; no hardware command is tied
+to this assessment.
 
 ## Not changed
 

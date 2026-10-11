@@ -16,12 +16,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 class FakeDecisionServer:
     def __init__(self, responses: list[dict] | None = None, delay_s: float = 0.0):
         """Each entry in `responses` is one of:
-          {"status": 200, "snack": "chips", "reply": "..."}  -- valid structured content
+          {"status": 200, "magic_type": "stormweaver", "magic_level": 7, "reply": "..."}
           {"status": 200, "content": "<raw string>"}          -- custom/malformed content
           {"status": 429}  or  {"status": 500}                -- error, empty-ish body
         Consumed in request order; the last entry repeats once the list is exhausted.
         """
-        self.responses = responses or [{"status": 200, "snack": "none", "reply": "ok"}]
+        self.responses = responses or [{"status": 200, "magic_type": "hedge witch", "magic_level": 5, "reply": "ok"}]
         self.delay_s = delay_s
         self.call_count = 0
         self._lock = threading.Lock()
@@ -69,7 +69,11 @@ class FakeDecisionServer:
                         if "content" in entry:
                             content = entry["content"]
                         else:
-                            content = json.dumps({"snack": entry.get("snack"), "reply": entry.get("reply", "")})
+                            content = json.dumps({
+                                "magic_type": entry.get("magic_type", "hedge witch"),
+                                "magic_level": entry.get("magic_level", 5),
+                                "reply": entry.get("reply", ""),
+                            })
                         body = json.dumps({"choices": [{"message": {"content": content}}]})
                     else:
                         body = json.dumps({"error": {"message": "fake error"}})

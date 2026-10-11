@@ -6,7 +6,7 @@ listen to it.
 Usage (from inside pi_app/, with a venv that has requirements.txt
 installed and LLM_API_KEY / TTS_API_KEY set in the environment):
 
-    python3 -m tools.try_request --text "something crunchy and salty"
+    python3 -m tools.try_request --text "I like quiet places and patient work"
     python3 -m tools.try_request --json-file tools/sample_request.json
     python3 -m tools.try_request --text "..." --play
 
@@ -25,7 +25,6 @@ from pi_app.decision_client import DecisionClient
 from pi_app.decision_service import DecisionService
 from pi_app.dotenv import load_secrets_env
 from pi_app.request_budget import CharacterBudget, RequestBudget
-from pi_app.snacks import SnacksStore
 from pi_app.tts_client import TtsClient
 
 
@@ -34,7 +33,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--text", help="the text to run through the pipeline")
     parser.add_argument("--json-file", help='a JSON file containing {"text": "..."}')
-    parser.add_argument("--snacks", default="config/snacks.json", help="path to snacks.json")
     parser.add_argument("--out", default="tools/output.mp3", help="where to save the resulting audio, if any")
     parser.add_argument("--play", action="store_true", help="also play the audio immediately")
     args = parser.parse_args()
@@ -54,8 +52,6 @@ def main():
     if missing:
         print(f"warning: {', '.join(missing)} not set in the environment -- the call(s) will fail", file=sys.stderr)
 
-    snacks_store = SnacksStore(args.snacks)
-
     decision_client = DecisionClient(
         base_url=os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1"),
         model=os.environ.get("LLM_MODEL", "gpt-5-nano"),
@@ -69,7 +65,7 @@ def main():
     )
     service = DecisionService(decision_client, tts_client, RequestBudget(), CharacterBudget())
 
-    message = service.handle("try-request", text, snacks_store.current)
+    message = service.handle("try-request", text)
 
     summary = dataclasses.asdict(message)
     summary["audio_mp3"] = f"<{len(message.audio_mp3)} bytes>" if message.audio_mp3 else None

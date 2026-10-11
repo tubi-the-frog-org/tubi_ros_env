@@ -1,21 +1,8 @@
-"""Connects outbound to the website's WebSocket hub as "the teammate
-system" (see website/docs/message-contract.md and website/CLAUDE.md's
-"Open question 2"): the website's server broadcasts to every connected
-client, so this is just another client on the same socket.
+"""Connects the Pi conversation service to the website's WebSocket hub.
 
-Drives the multi-turn ConversationSession (conversation_session.py):
-`session:start` begins one, `transcript` feeds it, `session:end`
-clears it. Sends a `speak` message per turn and an extended `display`
-message (with percentages) on reveal.
-
-Scope note: `speak` and `display.payload.percentages` are NOT yet in
-website/docs/message-contract.md -- that contract only covers the old
-one-shot shape. This is a proposal (see
-pi_app/docs/multi_turn_contract_proposal.md) for what the website side
-needs to add to actually drive a multi-turn UI; until then, sending
-these is harmless (the website's broadcast-everyone server will just
-pass them through to a browser that doesn't yet know what to do with
-them), but it isn't a real integration until that's agreed and built.
+`session:start` creates a conversation, `transcript` advances it, and
+`session:end` clears it. Replies are spoken on every turn; the final turn also
+sends a magic type and level display message.
 """
 
 from __future__ import annotations
@@ -29,15 +16,14 @@ import uuid
 import aiohttp
 
 from pi_app.audio_player import AudioPlayer, Esp32AudioPlayer
-from pi_app.conversation_session import ConversationSession, QuizResult
+from pi_app.conversation_session import ConversationSession, MagicResult
 from pi_app.decision_client import DecisionClient
 from pi_app.esp32_link import EspLink, estimate_audio_seconds, word_durations_ms
 from pi_app.request_budget import CharacterBudget, RequestBudget
-from pi_app.snacks import SnacksStore
 from pi_app.tts_client import TtsClient, TtsError
 
 RECONNECT_DELAY_S = 3.0
-QUIZ_RESULT_PATH = "tools/quiz_result.json"
+MAGIC_RESULT_PATH = "tools/magic_result.json"
 _BUDGET_EXHAUSTED_REPLY = "The mists are resting a moment... try again shortly, traveler."
 
 
@@ -51,9 +37,8 @@ class TeammateClient:
         character_budget: CharacterBudget,
         esp32_link: EspLink,
         audio_player: AudioPlayer,
-        snacks_store: SnacksStore,
         reconnect_delay_s: float = RECONNECT_DELAY_S,
-        quiz_result_path: str = QUIZ_RESULT_PATH,
+        magic_result_path: str = MAGIC_RESULT_PATH,
         logger: logging.Logger | None = None,
     ):
         self._ws_url = ws_url
@@ -63,9 +48,8 @@ class TeammateClient:
         self._character_budget = character_budget
         self._esp32_link = esp32_link
         self._audio_player = audio_player
-        self._snacks_store = snacks_store
         self._reconnect_delay_s = reconnect_delay_s
-        self._quiz_result_path = quiz_result_path
+        self._magic_result_path = magic_result_path
         self._logger = logger or logging.getLogger(__name__)
         self._session: ConversationSession | None = None
         # The guest may talk over Tubi: messages are handled in their own tasks
@@ -123,7 +107,7 @@ class TeammateClient:
             self._logger.info(f"session:start {session_id}")
             self._pending.clear()
             async with self._turn_lock:
-                self._session = ConversationSession(session_id, self._decision_client, self._snacks_store.current)
+                self._session = ConversationSession(session_id, self._decision_client)
                 reply = await self._run_llm(self._session.start)
                 await self._speak_turn(ws, reply)
             return
@@ -199,32 +183,21 @@ class TeammateClient:
             await loop.run_in_executor(None, self._esp32_link.talk, word_ms)
             await loop.run_in_executor(None, self._audio_player.play, audio)
 
-    async def _reveal(self, ws, result: QuizResult):
+    async def _reveal(self, ws, result: MagicResult):
         await ws.send_json({
             "type": "display",
             "payload": {
-                "kind": "result",
-                "snacks": [s.label for s in result.chosen_snacks],
-                "percentages": result.percentages,
+                "kind": "magic-assessment",
+                "magic_type": result.magic_type,
+                "magic_level": result.magic_level,
             },
         })
 
-        # The ESP32 runs the whole sequence itself (rotate to the bin, open
-        # the trap door, close it), so this is one command. Only one funnel
-        # can be targeted, so the first chosen snack's slot wins even when
-        # several snacks scored high enough to be named.
-        slot = result.chosen_snacks[0].slot
-        if 1 <= slot <= 4:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self._esp32_link.dispense, slot)
-        else:
-            self._logger.warning(f"chosen snack has no valid bin (slot={slot}); not dispensing")
-
         try:
-            with open(self._quiz_result_path, "w") as f:
+            with open(self._magic_result_path, "w") as f:
                 json.dump(dataclasses.asdict(result), f, indent=2)
         except OSError as e:
-            self._logger.warning(f"could not write quiz result to {self._quiz_result_path}: {e}")
+            self._logger.warning(f"could not write magic result to {self._magic_result_path}: {e}")
 
 
 def main():
@@ -237,9 +210,6 @@ def main():
 
     load_secrets_env() # load the secrets
 
-    snacks_path = os.environ.get("SNACKS_CONFIG_PATH", "config/snacks.json") # the place where snacks are stored
-    snacks_store = SnacksStore(snacks_path)
- 
     decision_client = DecisionClient( # cloud based llm we are using for reasoning
         base_url=os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1"),
         model=os.environ.get("LLM_MODEL", "gpt-5-nano"),
@@ -267,7 +237,6 @@ def main():
         character_budget=CharacterBudget(daily_limit=int(os.environ.get("TTS_DAILY_CHAR_CAP", "20000"))),
         esp32_link=esp32_link,
         audio_player=audio_player,
-        snacks_store=snacks_store,
     )
     asyncio.run(client.run_forever())
 

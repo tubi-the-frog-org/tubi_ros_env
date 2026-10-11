@@ -8,7 +8,6 @@ from aiohttp.test_utils import TestServer
 
 from pi_app.decision_client import ConversationTurn
 from pi_app.request_budget import CharacterBudget, RequestBudget
-from pi_app.snacks import SnacksStore
 from pi_app.teammate_client import TeammateClient
 
 
@@ -17,7 +16,7 @@ class StubDecisionClient:
         self._turns = list(turns)
         self.calls = 0
 
-    def converse(self, messages, snacks):
+    def converse(self, messages):
         turn = self._turns[min(self.calls, len(self._turns) - 1)]
         self.calls += 1
         return turn
@@ -76,39 +75,19 @@ class FakeWs:
 
 
 def _not_done(reply="Tell me about yourself!"):
-    return ConversationTurn(reply_text=reply, done=False, snack_ids=[], percentages=None)
+    return ConversationTurn(reply_text=reply, done=False, magic_type=None, magic_level=None)
 
 
-def _done(snack_ids=("chips",), reply="Chips await!", percentages=None):
+def _done(magic_type="Stormweaver", magic_level=7, reply="Your stormweaver spark is level seven!"):
     return ConversationTurn(
         reply_text=reply,
         done=True,
-        snack_ids=list(snack_ids),
-        percentages=percentages or {"cookies": 25.0, "chips": 75.0},
+        magic_type=magic_type,
+        magic_level=magic_level,
     )
 
 
-def _write_snacks(tmp_path):
-    path = tmp_path / "snacks.json"
-    path.write_text(json.dumps({
-        "version": 1,
-        "default_snack": "none",
-        "snacks": [
-            {"id": "chips", "label": "Chips", "slot": 3, "aliases": [], "tags": [],
-             "lines": [{"id": "c1", "text": "chips!"}]},
-            {"id": "none", "label": "No snack", "slot": 0, "aliases": [], "tags": [],
-             "lines": [{"id": "n1", "text": "nothing."}]},
-        ],
-    }))
-    return path
-
-
-@pytest.fixture
-def snacks_store(tmp_path):
-    return SnacksStore(str(_write_snacks(tmp_path)))
-
-
-def _client(snacks_store, turns, result_path, esp32_link=None, audio_player=None, request_budget=None, character_budget=None):
+def _client(turns, result_path, esp32_link=None, audio_player=None, request_budget=None, character_budget=None):
     decision_client = StubDecisionClient(turns)
     client = TeammateClient(
         "ws://unused",
@@ -118,14 +97,13 @@ def _client(snacks_store, turns, result_path, esp32_link=None, audio_player=None
         character_budget or CharacterBudget(),
         esp32_link or RecordingEspLink(),
         audio_player or RecordingAudioPlayer(),
-        snacks_store,
-        quiz_result_path=str(result_path),
+        magic_result_path=str(result_path),
     )
     return client, decision_client
 
 
-async def test_session_start_begins_a_conversation_and_speaks_intro(snacks_store, tmp_path):
-    client, decision_client = _client(snacks_store, [_not_done("Greetings, traveler!")], tmp_path / "result.json")
+async def test_session_start_begins_a_conversation_and_speaks_intro(tmp_path):
+    client, decision_client = _client([_not_done("Greetings, traveler!")], tmp_path / "result.json")
     ws = FakeWs()
 
     await client.handle_message(ws, json.dumps({"type": "session:start", "payload": {"sessionId": "s1"}}))
@@ -136,8 +114,8 @@ async def test_session_start_begins_a_conversation_and_speaks_intro(snacks_store
     assert client._session.session_id == "s1"
 
 
-async def test_transcript_with_no_active_session_is_ignored(snacks_store, tmp_path):
-    client, decision_client = _client(snacks_store, [_not_done()], tmp_path / "result.json")
+async def test_transcript_with_no_active_session_is_ignored(tmp_path):
+    client, decision_client = _client([_not_done()], tmp_path / "result.json")
     ws = FakeWs()
 
     await client.handle_message(ws, json.dumps({"type": "transcript", "payload": {"text": "hello"}}))
@@ -146,8 +124,8 @@ async def test_transcript_with_no_active_session_is_ignored(snacks_store, tmp_pa
     assert ws.sent == []
 
 
-async def test_transcript_advances_session_without_revealing(snacks_store, tmp_path):
-    client, decision_client = _client(snacks_store, [_not_done("Hi!"), _not_done("What's your vibe?")], tmp_path / "result.json")
+async def test_transcript_advances_session_without_revealing(tmp_path):
+    client, decision_client = _client([_not_done("Hi!"), _not_done("What's your vibe?")], tmp_path / "result.json")
     ws = FakeWs()
     await client.handle_message(ws, json.dumps({"type": "session:start", "payload": {}}))
 
@@ -159,11 +137,10 @@ async def test_transcript_advances_session_without_revealing(snacks_store, tmp_p
     assert client._session is not None  # still ongoing
 
 
-async def test_reveal_sends_display_with_percentages_plays_audio_and_dispenses(snacks_store, tmp_path):
+async def test_reveal_sends_magic_assessment_and_plays_audio_without_dispensing(tmp_path):
     result_path = tmp_path / "result.json"
     client, decision_client = _client(
-        snacks_store,
-        [_not_done("Hi!"), _done(snack_ids=("chips",), reply="Chips await!", percentages={"chips": 80.0, "none": 20.0})],
+        [_not_done("Hi!"), _done()],
         result_path,
     )
     ws = FakeWs()
@@ -172,31 +149,19 @@ async def test_reveal_sends_display_with_percentages_plays_audio_and_dispenses(s
     await client.handle_message(ws, json.dumps({"type": "transcript", "payload": {"text": "yes reveal it"}}))
 
     display_msgs = [m for m in ws.sent if m["type"] == "display"]
-    assert display_msgs == [{"type": "display", "payload": {"kind": "result", "snacks": ["Chips"], "percentages": {"chips": 80.0, "none": 20.0}}}]
-    assert len(client._esp32_link.dispensed) == 1
+    assert display_msgs == [{"type": "display", "payload": {
+        "kind": "magic-assessment", "magic_type": "Stormweaver", "magic_level": 7,
+    }}]
+    assert client._esp32_link.dispensed == []
     assert client._audio_player.played == [b"mp3-bytes", b"mp3-bytes"]  # intro + reveal
     assert client._session is None  # cleared after reveal
     saved = json.loads(result_path.read_text())
-    assert [s["id"] for s in saved["chosen_snacks"]] == ["chips"]
+    assert saved["magic_type"] == "Stormweaver"
+    assert saved["magic_level"] == 7
 
 
-async def test_reveal_can_display_multiple_chosen_snacks(snacks_store, tmp_path):
-    client, decision_client = _client(
-        snacks_store,
-        [_not_done("Hi!"), _done(snack_ids=("chips", "none"), reply="Both chips and nothing suit you!", percentages={"chips": 70.0, "none": 65.0})],
-        tmp_path / "result.json",
-    )
-    ws = FakeWs()
-    await client.handle_message(ws, json.dumps({"type": "session:start", "payload": {}}))
-
-    await client.handle_message(ws, json.dumps({"type": "transcript", "payload": {"text": "yes reveal it"}}))
-
-    display_msgs = [m for m in ws.sent if m["type"] == "display"]
-    assert display_msgs[0]["payload"]["snacks"] == ["Chips", "No snack"]
-
-
-async def test_session_end_clears_session(snacks_store, tmp_path):
-    client, _ = _client(snacks_store, [_not_done("Hi!")], tmp_path / "result.json")
+async def test_session_end_clears_session(tmp_path):
+    client, _ = _client([_not_done("Hi!")], tmp_path / "result.json")
     ws = FakeWs()
     await client.handle_message(ws, json.dumps({"type": "session:start", "payload": {}}))
     assert client._session is not None
@@ -206,9 +171,9 @@ async def test_session_end_clears_session(snacks_store, tmp_path):
     assert client._session is None
 
 
-async def test_request_budget_exhausted_sends_fallback_without_calling_llm(snacks_store, tmp_path):
+async def test_request_budget_exhausted_sends_fallback_without_calling_llm(tmp_path):
     client, decision_client = _client(
-        snacks_store, [_not_done("Hi!")], tmp_path / "result.json",
+        [_not_done("Hi!")], tmp_path / "result.json",
         request_budget=RequestBudget(daily_limit=0),
     )
     ws = FakeWs()
@@ -219,10 +184,10 @@ async def test_request_budget_exhausted_sends_fallback_without_calling_llm(snack
     assert any("mists are resting" in m["payload"]["text"] for m in ws.sent if m["type"] == "speak")
 
 
-async def test_character_budget_exhausted_skips_audio(snacks_store, tmp_path):
+async def test_character_budget_exhausted_skips_audio(tmp_path):
     audio_player = RecordingAudioPlayer()
     client, _ = _client(
-        snacks_store, [_not_done("Hi!")], tmp_path / "result.json",
+        [_not_done("Hi!")], tmp_path / "result.json",
         audio_player=audio_player,
         character_budget=CharacterBudget(daily_limit=0),
     )
@@ -234,7 +199,7 @@ async def test_character_budget_exhausted_skips_audio(snacks_store, tmp_path):
     assert not any(m["type"] == "state" for m in ws.sent)  # no tubi/speaking state anymore
 
 
-async def test_real_websocket_roundtrip(snacks_store, tmp_path):
+async def test_real_websocket_roundtrip(tmp_path):
     """End-to-end sanity check against a real (test) websocket server."""
     received_from_client = []
 
@@ -254,7 +219,7 @@ async def test_real_websocket_roundtrip(snacks_store, tmp_path):
     server = TestServer(app)
     await server.start_server()
     try:
-        client, _ = _client(snacks_store, [_not_done("Greetings!")], tmp_path / "result.json")
+        client, _ = _client([_not_done("Greetings!")], tmp_path / "result.json")
         client._ws_url = str(server.make_url("/")).replace("http://", "ws://")
 
         async with aiohttp.ClientSession() as session:
@@ -277,9 +242,9 @@ class SlowAudioPlayer:
         time.sleep(0.3)
 
 
-async def test_guest_talking_over_tubi_is_heard_and_merged_into_one_turn(snacks_store, tmp_path):
+async def test_guest_talking_over_tubi_is_heard_and_merged_into_one_turn(tmp_path):
     client, decision_client = _client(
-        snacks_store, [_not_done("Intro."), _not_done("First reply."), _not_done("Merged reply.")],
+        [_not_done("Intro."), _not_done("First reply."), _not_done("Merged reply.")],
         tmp_path / "result.json", audio_player=SlowAudioPlayer(),
     )
     ws = FakeWs()
@@ -287,9 +252,9 @@ async def test_guest_talking_over_tubi_is_heard_and_merged_into_one_turn(snacks_
     seen = []
     real_converse = decision_client.converse
 
-    def spy(messages, snacks):
+    def spy(messages):
         seen.append(messages[-1]["content"])
-        return real_converse(messages, snacks)
+        return real_converse(messages)
 
     decision_client.converse = spy
 

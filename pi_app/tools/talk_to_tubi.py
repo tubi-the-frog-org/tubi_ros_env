@@ -30,7 +30,6 @@ from pi_app.audio_player import AudioPlayer
 from pi_app.conversation_session import ConversationSession
 from pi_app.decision_client import DecisionClient
 from pi_app.dotenv import load_secrets_env
-from pi_app.snacks import SnacksStore
 from pi_app.tts_client import TtsClient
 
 
@@ -74,7 +73,6 @@ def main():
     with microphone as source:
         recognizer.adjust_for_ambient_noise(source)
 
-    snacks_store = SnacksStore(os.environ.get("SNACKS_CONFIG_PATH", "config/snacks.json"))
     decision_client = DecisionClient(
         base_url=os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1"),
         model=os.environ.get("LLM_MODEL", "gpt-5-nano"),
@@ -89,7 +87,7 @@ def main():
     audio_player = AudioPlayer()
 
     session_id = str(uuid.uuid4())
-    session = ConversationSession(session_id, decision_client, snacks_store.current)
+    session = ConversationSession(session_id, decision_client)
 
     def speak(text: str):
         print(f"\nTubi: {text}\n")
@@ -112,7 +110,7 @@ def main():
     result = dataclasses.asdict(session.result)
     print(json.dumps(result, indent=2))
 
-    out_path = os.environ.get("QUIZ_RESULT_PATH", "tools/quiz_result.json")
+    out_path = os.environ.get("MAGIC_RESULT_PATH", "tools/magic_result.json")
     with open(out_path, "w") as f:
         json.dump(result, f, indent=2)
     print(f"\nresult saved to {out_path}", file=sys.stderr)

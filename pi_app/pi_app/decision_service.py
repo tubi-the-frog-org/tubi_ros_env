@@ -1,8 +1,4 @@
-"""Orchestrates one request end to end: budget check -> decision call ->
-character budget check -> TTS call -> SnackMessage. Never raises --
-every failure degrades to a SnackMessage (with or without audio)
-rather than an exception reaching the HTTP layer.
-"""
+"""Orchestrates one-shot magic assessment, TTS, and budget fallbacks."""
 
 from __future__ import annotations
 
@@ -14,10 +10,9 @@ from pi_app.message_package import (
     SOURCE_FALLBACK_ERROR,
     SOURCE_OK,
     SOURCE_OK_NO_AUDIO,
-    SnackMessage,
+    MagicMessage,
 )
 from pi_app.request_budget import CharacterBudget, RequestBudget
-from pi_app.snacks import SnacksConfig
 from pi_app.tts_client import TtsClient, TtsError
 
 _BUDGET_EXCEEDED_REPLY = "The mists are resting... ask again in a moment, traveler."
@@ -39,27 +34,24 @@ class DecisionService:
         self._character_budget = character_budget
         self._logger = logger or logging.getLogger(__name__)
 
-    def handle(self, request_id: str, raw_text: str, snacks: SnacksConfig) -> SnackMessage:
+    def handle(self, request_id: str, raw_text: str) -> MagicMessage:
         if not self._request_budget.try_consume():
             self._logger.warning(
                 f"[{request_id}] decision request budget exhausted "
                 f"(daily={self._request_budget.daily_count}/{self._request_budget.daily_limit}, "
                 f"total={self._request_budget.total_count}/{self._request_budget.total_limit})"
             )
-            default_snack = snacks.get(snacks.default_snack)
-            return SnackMessage(request_id, default_snack.id, default_snack.slot, _BUDGET_EXCEEDED_REPLY, None, SOURCE_FALLBACK_BUDGET)
+            return MagicMessage(request_id, None, None, _BUDGET_EXCEEDED_REPLY, None, SOURCE_FALLBACK_BUDGET)
 
         try:
-            snack_id, reply_text = self._decision_client.choose_snack_and_reply(raw_text, snacks.snacks)
+            magic_type, magic_level, reply_text = self._decision_client.assess_magic_user(raw_text)
         except DecisionError as e:
             self._logger.warning(f"[{request_id}] decision call failed: {e}")
-            default_snack = snacks.get(snacks.default_snack)
-            return SnackMessage(request_id, default_snack.id, default_snack.slot, _DECISION_ERROR_REPLY, None, SOURCE_FALLBACK_ERROR)
+            return MagicMessage(request_id, None, None, _DECISION_ERROR_REPLY, None, SOURCE_FALLBACK_ERROR)
 
-        snack = snacks.get(snack_id)
         audio = self._try_synthesize(request_id, reply_text)
         source = SOURCE_OK if audio is not None else SOURCE_OK_NO_AUDIO
-        return SnackMessage(request_id, snack.id, snack.slot, reply_text, audio, source)
+        return MagicMessage(request_id, magic_type, magic_level, reply_text, audio, source)
 
     def _try_synthesize(self, request_id: str, reply_text: str) -> bytes | None:
         if not self._character_budget.try_consume(len(reply_text)):

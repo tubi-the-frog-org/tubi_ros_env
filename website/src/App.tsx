@@ -15,6 +15,19 @@ type ServerMessage = {
   state?: SessionState;
 };
 
+// iPhones can't always record WebM (older Safari only does MP4), so pick whatever this browser supports.
+const pickRecorderMimeType = () => {
+  const candidates = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'];
+  return candidates.find((type) => MediaRecorder.isTypeSupported(type)) ?? '';
+};
+
+const extensionForMimeType = (mimeType: string) => {
+  if (mimeType.includes('mp4')) return 'mp4';
+  if (mimeType.includes('ogg')) return 'ogg';
+  if (mimeType.includes('wav')) return 'wav';
+  return 'webm';
+};
+
 const getSocketUrl = () => {
   const host = window.location.hostname;
   const port = window.location.port;
@@ -334,6 +347,9 @@ function App() {
     recordingRequestedRef.current = true;
 
     try {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new DOMException('This page needs https:// to use the microphone.', 'NotSupportedError');
+      }
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -397,8 +413,9 @@ function App() {
         return;
       }
 
-      const mimeType = MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : 'audio/webm;codecs=opus';
-      const recorder = new MediaRecorder(stream, { mimeType });
+      const preferredMimeType = pickRecorderMimeType();
+      const recorder = new MediaRecorder(stream, preferredMimeType ? { mimeType: preferredMimeType } : undefined);
+      const mimeType = recorder.mimeType || preferredMimeType || 'audio/webm';
       chunksRef.current = [];
 
       recorder.ondataavailable = (event) => {
@@ -428,8 +445,8 @@ function App() {
           body: JSON.stringify({
             sessionId: activeSessionId,
             audioBase64: base64,
-            mimeType: audioBlob.type || 'audio/webm',
-            extension: audioBlob.type.includes('wav') ? 'wav' : 'webm'
+            mimeType: audioBlob.type || mimeType,
+            extension: extensionForMimeType(audioBlob.type || mimeType)
           })
         });
 
@@ -449,7 +466,10 @@ function App() {
         : 'Listening... release when you are done speaking.');
     } catch (error) {
       setIsCalibrating(false);
-      setStatus('Microphone access was blocked. Please allow access and try again.');
+      const name = error instanceof DOMException ? error.name : '';
+      setStatus(name === 'NotAllowedError' || name === 'SecurityError'
+        ? 'Microphone access was blocked. Allow the mic for this site in your browser settings and try again.'
+        : `Could not start recording (${name || 'error'}: ${error instanceof Error ? error.message : 'unknown'}).`);
     }
   };
 

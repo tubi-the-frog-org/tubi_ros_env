@@ -283,7 +283,7 @@ static const char *dac_tag  = "DAC";
 
 /* ---- DAC parameters for AUDIO ---- */
 #define DAC_FREQ_HZ    22050       /* must match the MP3's sample rate */
-#define DAC_DESC_NUM   4
+#define DAC_DESC_NUM   6           /* docs suggest more than 5 so the DMA never starves */
 #define DAC_BUF_SIZE   2048
 
 #define PCM_STREAM_SIZE (16 * 1024)   /* 8-bit samples: ~0.74 s at 22.05 kHz */
@@ -314,35 +314,46 @@ static bool IRAM_ATTR dac_on_convert_done(dac_continuous_handle_t handle,
     return woken == pdTRUE;
 }
 
-// Task: refill each finished buffer with PCM (or silence)
+// Task: refill each finished DMA buffer with PCM (or silence).
+// NOTE: on the original ESP32 the driver expands 8-bit samples to 16-bit, so a DMA buffer
+// holds only buf_size/2 samples. dac_continuous_write_asynchronously() reports how many
+// bytes it really took in `loaded`; whatever it didn't take must be kept for the next
+// buffer, otherwise audio is silently dropped and the track plays too fast (and then
+// starves, giving sped-up bursts with gaps).
 static void dac_feed_task(void *arg)
 {
-    static uint8_t stage[DAC_BUF_SIZE];
+    static uint8_t stage[DAC_BUF_SIZE];     // real PCM first, silence padding after it
+    static uint8_t silence[DAC_BUF_SIZE];
+    memset(silence, 128, sizeof(silence));  // 128 = mid-scale silence
+    size_t staged = 0;                      // real PCM bytes waiting in stage[]
     dac_event_data_t evt;
+
     while (1) {
         xQueueReceive(dac_evt_queue, &evt, portMAX_DELAY);
 
         /* Don't start (or restart after an underrun) until there's a cushion of PCM,
          * unless the track is over and we just need to play out the tail. */
         if (!s_prefilled &&
-            (s_flush || xStreamBufferBytesAvailable(pcm_stream) >= PREFILL_BYTES)) {
+            (s_flush || staged + xStreamBufferBytesAvailable(pcm_stream) >= PREFILL_BYTES)) {
             s_prefilled = true;
         }
 
-        size_t got = 0;
-        if (s_prefilled) {
-            got = xStreamBufferReceive(pcm_stream, stage, evt.buf_size, 0);
-            if (got < evt.buf_size) {
-                s_prefilled = false;               // ran dry: re-buffer before resuming
-            }
-        }
-        if (got < evt.buf_size) {
-            memset(stage + got, 128, evt.buf_size - got);   // 128 = mid-scale silence
-        }
-
         size_t loaded = 0;
-        dac_continuous_write_asynchronously(asynch_continous, evt.buf, evt.buf_size,
-                                            stage, evt.buf_size, &loaded);
+        if (s_prefilled) {
+            staged += xStreamBufferReceive(pcm_stream, stage + staged, DAC_BUF_SIZE - staged, 0);
+            memset(stage + staged, 128, DAC_BUF_SIZE - staged);          // pad with silence
+            dac_continuous_write_asynchronously(asynch_continous, evt.buf, evt.buf_size,
+                                                stage, DAC_BUF_SIZE, &loaded);
+            if (loaded > staged) {          // the DMA swallowed padding: we ran dry
+                loaded = staged;
+                s_prefilled = false;        // re-buffer before resuming
+            }
+            staged -= loaded;               // keep what the DMA didn't take
+            memmove(stage, stage + loaded, staged);
+        } else {
+            dac_continuous_write_asynchronously(asynch_continous, evt.buf, evt.buf_size,
+                                                silence, DAC_BUF_SIZE, &loaded);
+        }
     }
 }
 

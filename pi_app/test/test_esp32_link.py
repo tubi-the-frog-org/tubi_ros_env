@@ -93,3 +93,80 @@ def test_null_link_does_nothing():
     link.set_slot(1)
     link.talk([100])
     link.dispense(1)
+
+
+class _FakePigpioPi:
+    """Just enough of pigpio.pi() to check what SoftSerialEspLink asks it to do."""
+
+    def __init__(self, busy_polls=0):
+        self.calls = []
+        self.serial_payloads = []
+        self._busy = busy_polls
+
+    def set_mode(self, gpio, mode):
+        self.calls.append(("set_mode", gpio, mode))
+
+    def write(self, gpio, level):
+        self.calls.append(("write", gpio, level))
+
+    def wave_tx_busy(self):
+        if self._busy > 0:
+            self._busy -= 1
+            return True
+        return False
+
+    def wave_clear(self):
+        self.calls.append(("wave_clear",))
+
+    def wave_add_serial(self, gpio, baud, data):
+        self.serial_payloads.append((gpio, baud, data))
+
+    def wave_create(self):
+        return 7
+
+    def wave_send_once(self, wave_id):
+        self.calls.append(("wave_send_once", wave_id))
+
+    def stop(self):
+        self.calls.append(("stop",))
+
+
+def test_soft_serial_link_idles_high_and_sends_firmware_commands_on_one_gpio():
+    from pi_app.esp32_link import SoftSerialEspLink
+
+    pi = _FakePigpioPi()
+    link = SoftSerialEspLink(gpio=18, pi=pi)
+    link.talk([300, 250, 400])
+    link.dispense(2)
+
+    assert ("set_mode", 18, 1) in pi.calls and ("write", 18, 1) in pi.calls  # output, idle high
+    assert pi.serial_payloads[0] == (18, 115200, b"\ntalk 300 250 400\n")  # leading \n resyncs the board's line parser
+    assert pi.serial_payloads[1][2] == b"\ndispense 2\n"
+    assert ("wave_send_once", 7) in pi.calls
+
+
+def test_soft_serial_link_waits_for_the_previous_transmission_to_finish():
+    from pi_app.esp32_link import SoftSerialEspLink
+
+    sleeps = []
+    pi = _FakePigpioPi(busy_polls=3)
+    SoftSerialEspLink(gpio=18, pi=pi, sleep=sleeps.append).talk([200])
+    assert len(sleeps) == 3  # polled until idle before clearing the wave
+
+
+def test_open_motor_link_prefers_soft_serial_and_never_raises(monkeypatch):
+    import pi_app.esp32_link as link_mod
+
+    # Soft serial requested but pigpiod unreachable / pigpio missing -> no-op link, not a crash.
+    assert isinstance(link_mod.open_motor_link({"ESP32_SOFT_TX_GPIO": "18"}), link_mod.NullEspLink)
+    # Bad config values and unopenable USB ports also degrade to the no-op link.
+    assert isinstance(link_mod.open_motor_link({"ESP32_SOFT_TX_GPIO": "notanumber"}), link_mod.NullEspLink)
+    assert isinstance(link_mod.open_motor_link({"ESP32_SERIAL_PORT": "/dev/does-not-exist"}), link_mod.NullEspLink)
+    assert isinstance(link_mod.open_motor_link({}), link_mod.NullEspLink)
+
+    sentinel = object()
+    monkeypatch.setattr(link_mod, "SoftSerialEspLink", lambda gpio: ("soft", gpio))
+    monkeypatch.setattr(link_mod, "SerialEspLink", lambda port: ("usb", port))
+    both = {"ESP32_SOFT_TX_GPIO": "18", "ESP32_SERIAL_PORT": "/dev/ttyUSB0"}
+    assert link_mod.open_motor_link(both) == ("soft", 18)  # soft serial wins when both are set
+    assert link_mod.open_motor_link({"ESP32_SERIAL_PORT": "/dev/ttyUSB0"}) == ("usb", "/dev/ttyUSB0")

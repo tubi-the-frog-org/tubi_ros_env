@@ -189,7 +189,10 @@ void app_main(void)
     while (1) {
         uint32_t len = wait_for_pi_header();
         if (forward_track(len)) {
-            if (wait_for_done(3 * 60 * 1000)) {
+            /* The DOIT sends 'D' when the clip has finished playing, i.e. about len/4000 s after the first
+             * byte at 32 kbit/s. Allow a generous len/2000 s (+15 s) so a lost 'D' can never keep the
+             * bridge from accepting the next sentence for minutes. */
+            if (wait_for_done(len / 2 + 15000)) {
                 ESP_LOGI(TAG, "ESP32 reports track finished, telling the Pi");
                 uart_write_bytes(PI_UART, "D", 1);   /* Pi's Esp32AudioPlayer waits for this */
             } else {

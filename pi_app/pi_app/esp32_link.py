@@ -14,6 +14,8 @@ firmware no longer understands.
 
 from __future__ import annotations
 
+import logging
+import os
 import time
 from abc import ABC, abstractmethod
 
@@ -81,21 +83,12 @@ class NullEspLink(EspLink):
         pass
 
 
-class SerialEspLink(EspLink):
-    def __init__(self, port: str, baudrate: int = 115200, timeout_s: float = 2.0, serial_factory=None,
-                 open_settle_s: float = 2.0):
-        real_port = serial_factory is None
-        if real_port:
-            import serial  # pyserial; imported lazily so tests don't need the real hardware lib
-            serial_factory = serial.Serial
-        self._conn = serial_factory(port, baudrate, timeout=timeout_s)
-        if real_port:
-            # Opening a USB-serial port toggles DTR/RTS, which resets a DOIT
-            # devkit; give it time to reboot before the first command.
-            time.sleep(open_settle_s)
+class _LineEspLink(EspLink):
+    """The firmware's text protocol (one command per line); subclasses only
+    decide how a line physically gets to the board."""
 
     def _send(self, line: str) -> None:
-        self._conn.write(f"{line}\n".encode("ascii"))
+        raise NotImplementedError
 
     def open_trap_door(self) -> None:
         self._send("door open")
@@ -113,5 +106,101 @@ class SerialEspLink(EspLink):
         if word_ms:
             self._send("talk " + " ".join(str(m) for m in word_ms[:64]))
 
+
+class SerialEspLink(_LineEspLink):
+    """The motor ESP32 over a USB-serial (or any real UART) device."""
+
+    def __init__(self, port: str | None = None, baudrate: int = 115200, timeout_s: float = 2.0, serial_factory=None,
+                 open_settle_s: float = 2.0, conn=None):
+        if conn is not None:
+            self._conn = conn  # a connection shared with the audio player (one-board firmware): already open
+            return
+        real_port = serial_factory is None
+        if real_port:
+            import serial  # pyserial; imported lazily so tests don't need the real hardware lib
+            serial_factory = serial.Serial
+        self._conn = serial_factory(port, baudrate, timeout=timeout_s)
+        if real_port:
+            # Opening a USB-serial port toggles DTR/RTS, which resets a DOIT
+            # devkit; give it time to reboot before the first command.
+            time.sleep(open_settle_s)
+
+    def _send(self, line: str) -> None:
+        self._conn.write(f"{line}\n".encode("ascii"))
+
     def close(self) -> None:
         self._conn.close()
+
+
+class SoftSerialEspLink(_LineEspLink):
+    """The motor ESP32 over ONE wire, no USB: the Pi bit-bangs 8N1 serial out of
+    a spare GPIO (default GPIO18 = header pin 12) into the board's RX0 pin
+    (GPIO3), plus a shared GND.
+
+    The Pi's only hardware UART (pins 8/10) is busy with the audio link, and the
+    motor commands only ever flow Pi -> board, so a transmit-only soft serial is
+    enough. pigpio builds the waveform on the DMA engine, so 115200 baud timing
+    is exact (software timing in Python would not be). Needs the pigpiod daemon.
+    """
+
+    _GPIO_OUTPUT = 1  # pigpio.OUTPUT, spelled out so tests don't need pigpio installed
+    _BUSY_TIMEOUT_S = 2.0
+
+    def __init__(self, gpio: int = 18, baudrate: int = 115200, pi=None, sleep=time.sleep):
+        if pi is None:
+            import pigpio  # pure-python client for the pigpiod daemon
+            pi = pigpio.pi()
+            if not pi.connected:
+                raise OSError("could not reach pigpiod (start it: sudo systemctl enable --now pigpiod)")
+        self._pi = pi
+        self._gpio = gpio
+        self._baud = baudrate
+        self._sleep = sleep
+        pi.set_mode(gpio, self._GPIO_OUTPUT)
+        pi.write(gpio, 1)  # a UART line idles high
+
+    def _wait_idle(self) -> None:
+        waited = 0.0
+        while self._pi.wave_tx_busy():
+            if waited >= self._BUSY_TIMEOUT_S:
+                raise OSError("previous soft-serial transmission never finished")
+            self._sleep(0.002)
+            waited += 0.002
+
+    def _send(self, line: str) -> None:
+        # The leading newline ends any half-received line the board may have
+        # picked up from line noise; the firmware ignores empty lines.
+        data = f"\n{line}\n".encode("ascii")
+        self._wait_idle()
+        self._pi.wave_clear()
+        self._pi.wave_add_serial(self._gpio, self._baud, data)
+        wave_id = self._pi.wave_create()
+        if wave_id < 0:
+            raise OSError(f"pigpio could not build the serial waveform (error {wave_id})")
+        self._pi.wave_send_once(wave_id)
+
+    def close(self) -> None:
+        self._pi.stop()
+
+
+def open_motor_link(environ=None, logger: logging.Logger | None = None) -> EspLink:
+    """Picks the motor ESP32 link from the environment, never raising: if the
+    configured link can't be opened, log it loudly and return a no-op link so
+    the rest of Tubi (voice, conversation) keeps working without motion.
+
+        ESP32_SOFT_TX_GPIO=18        one wire, no USB (see SoftSerialEspLink)
+        ESP32_SERIAL_PORT=/dev/...   a USB-serial / UART device
+    """
+    environ = os.environ if environ is None else environ
+    logger = logger or logging.getLogger(__name__)
+    soft_gpio = environ.get("ESP32_SOFT_TX_GPIO")
+    port = environ.get("ESP32_SERIAL_PORT")
+    try:
+        if soft_gpio:
+            return SoftSerialEspLink(int(soft_gpio))
+        if port:
+            return SerialEspLink(port)
+    except (OSError, ValueError, ImportError) as e:
+        target = f"ESP32_SOFT_TX_GPIO={soft_gpio}" if soft_gpio else f"ESP32_SERIAL_PORT={port}"
+        logger.error(f"could not open motor link ({target}): {e}; running with NO head/arm/door motion")
+    return NullEspLink()

@@ -3,7 +3,7 @@
 
 #define MINIMP3_IMPLEMENTATION
 #define MINIMP3_ONLY_MP3
-#include "minimp3.h"
+#include "Minimp3.h"   /* must match the file name exactly: Linux file systems are case-sensitive */
 
 #define MP3_BUF_SIZE     (16 * 1024)   /* minimp3 wants a generous window to find sync   */
 #define REFILL_MIN_ROOM  4096          /* only top up when at least this much is free    */

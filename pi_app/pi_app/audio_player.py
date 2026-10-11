@@ -18,6 +18,7 @@ import struct
 import subprocess
 import tempfile
 import time
+from contextlib import nullcontext
 
 
 class AudioPlayer:
@@ -54,35 +55,46 @@ class AudioPlayer:
 class Esp32AudioPlayer:
     """Streams mp3 bytes to the ESP32 audio firmware over a UART.
 
-    Protocol (esp32_firmware/src/dac_music_decoder/src/main.c):
+    Protocol (esp32_firmware/src/tubi_one_board/src/main.c, and dac_music_decoder before it):
         'A' 'U' 'D' | uint32 length (little-endian) | mp3 bytes
-    and the ESP32 answers a single 'D' once the track has finished playing.
+    and the ESP32 answers a single ack byte once the track has finished playing: 'D' from the
+    S3-bridge setup, 0x06 from the one-board firmware (pass ack=b"\x06" / AUDIO_ACK_BYTE=6).
 
-    The ESP32 has a 32 KB receive buffer and no flow control is wired, so
-    after an initial burst the bytes are paced just above the audio's own
-    bitrate. Same contract as AudioPlayer: play() never raises, and returns
-    only once the speech has finished (so "speaking" ends when it's quiet).
+    The ESP32 has a 32 KB receive buffer and the Pi ignores the RTS flow-control line, so after an
+    initial burst the bytes are paced just above the audio's own bitrate. Same contract as
+    AudioPlayer: play() never raises, and returns only once the speech has finished (so "speaking"
+    ends when it's quiet).
+
+    The serial connection may be shared with the motor commands (one wire carries both on the
+    one-board firmware): pass `conn` (see hardware.LockedSerial) instead of a port to open.
     """
 
-    BURST_BYTES = 8 * 1024
+    BURST_BYTES = 16 * 1024  # ~4 s of cushion in the ESP32's 32 KB ring before pacing starts
     CHUNK_BYTES = 1024
     PACE_FACTOR = 1.1  # send 10% faster than playback
 
     def __init__(
         self,
-        port: str,
+        port: str | None = None,
         baudrate: int = 921600,
         bytes_per_second: int = 4000,  # mp3_22050_32
         serial_factory=None,
         sleep=time.sleep,
+        clock=time.monotonic,
         logger: logging.Logger | None = None,
+        conn=None,
+        ack: bytes = b"D",
     ):
-        if serial_factory is None:
-            import serial  # pyserial; lazy so tests/dev machines don't need hardware
-            serial_factory = serial.Serial
-        self._conn = serial_factory(port, baudrate, timeout=1.0)
+        if conn is None:
+            if serial_factory is None:
+                import serial  # pyserial; lazy so tests/dev machines don't need hardware
+                serial_factory = serial.Serial
+            conn = serial_factory(port, baudrate, timeout=1.0)
+        self._conn = conn
+        self._ack = ack
         self._bytes_per_second = bytes_per_second
         self._sleep = sleep
+        self._clock = clock
         self._logger = logger or logging.getLogger(__name__)
 
     def play(self, audio_mp3: bytes) -> None:
@@ -95,17 +107,28 @@ class Esp32AudioPlayer:
 
     def _stream(self, audio: bytes) -> None:
         self._conn.reset_input_buffer()
-        self._conn.write(b"AUD" + struct.pack("<I", len(audio)))
-        self._conn.write(audio[: self.BURST_BYTES])
-        pace_s = self.CHUNK_BYTES / (self._bytes_per_second * self.PACE_FACTOR)
-        for i in range(self.BURST_BYTES, len(audio), self.CHUNK_BYTES):
-            self._conn.write(audio[i : i + self.CHUNK_BYTES])
-            self._sleep(pace_s)
+        # On a shared connection, hold the write lock for the whole send so a motor command from
+        # another thread can never land in the middle of the audio frame.
+        with getattr(self._conn, "transaction", nullcontext)():
+            # Header and first burst in ONE write: the start of the frame is atomic.
+            self._conn.write(b"AUD" + struct.pack("<I", len(audio)) + audio[: self.BURST_BYTES])
+            # Pace against ABSOLUTE deadlines (chunk k goes out at start + k*CHUNK/rate), not
+            # "sleep a fixed time after each chunk": with the latter, every bit of scheduler delay
+            # on a busy Pi accumulates, the ESP32's buffer runs dry and the DAC drops out. With
+            # deadlines a late chunk is followed by a short sleep, so the schedule catches back up.
+            rate = self._bytes_per_second * self.PACE_FACTOR
+            start = self._clock()
+            for off in range(self.BURST_BYTES, len(audio), self.CHUNK_BYTES):
+                delay = start + (off - self.BURST_BYTES) / rate - self._clock()
+                if delay > 0:
+                    self._sleep(delay)
+                self._conn.write(audio[off : off + self.CHUNK_BYTES])
 
-        # Wait for the ESP32's 'D' (track finished); bail out after the
-        # audio's expected length plus slack so a dead link can't hang a turn.
+        # Wait for the ESP32's ack (track finished playing). On a shared wire its text replies
+        # arrive here too and are simply skipped. Bail out after the audio's expected length plus
+        # slack so a dead link can't hang a turn.
         deadline = time.monotonic() + len(audio) / self._bytes_per_second + 3.0
         while time.monotonic() < deadline:
-            if self._conn.read(1) == b"D":
+            if self._conn.read(1) == self._ack:
                 return
-        self._logger.warning("ESP32 never acknowledged end of track (wiring? baud rate?)")
+        self._logger.warning("ESP32 never acknowledged end of track (wiring? baud rate? ack byte?)")

@@ -7,14 +7,13 @@
 import os
 import sys
 
-from pi_app.audio_player import Esp32AudioPlayer
 from pi_app.dotenv import load_secrets_env
+from pi_app.hardware import open_hardware
 from pi_app.tts_client import TtsClient
 
 
 def main():
     load_secrets_env()
-    port = os.environ.get("AUDIO_SERIAL_PORT") or "/dev/serial0"
     text = " ".join(sys.argv[1:]) or "Ribbit! Testing, one two three."
     tts = TtsClient(
         base_url=os.environ.get("TTS_BASE_URL", "https://api.elevenlabs.io/v1"),
@@ -24,9 +23,10 @@ def main():
         output_format="mp3_22050_32",
     )
     audio = tts.synthesize(text)
-    print(f"got {len(audio)} bytes of mp3; streaming to {port} ...")
-    Esp32AudioPlayer(port, bytes_per_second=tts.bytes_per_second).play(audio)
-    print("done (a warning above means the ESP32 never sent its 'D' ack)")
+    print(f"got {len(audio)} bytes of mp3; streaming to {os.environ.get('AUDIO_SERIAL_PORT') or 'the Pi speaker'} ...")
+    player = open_hardware(os.environ, tts.bytes_per_second)[1]  # honours AUDIO_SERIAL_PORT / AUDIO_ACK_BYTE
+    player.play(audio)
+    print("done (a warning above means the ESP32 never sent its end-of-clip ack)")
 
 
 if __name__ == "__main__":

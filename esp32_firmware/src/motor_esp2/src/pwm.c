@@ -155,6 +155,7 @@ analyzer during debugging
  *                             same time as a talk (separate servos). Replies
  *                             "OK dispense done" when finished.
  *     stop                    abort talk AND dispense; head/arm to rest, door closes
+ *     tasks                   print each FreeRTOS task's minimum free stack + free heap (diagnostic)
  *
  *   TEST mode only (find out how far each servo should go):
  *     head <deg>   arm <deg>   lazy <deg>   door <deg>
@@ -178,7 +179,10 @@ analyzer during debugging
 #include "driver/uart.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "pwm.h"
 
 #define UART_NUM            UART_NUM_0
@@ -250,6 +254,38 @@ static servo_t servos[SERVO_COUNT] = {
                      .min_deg = 0,   .max_deg = 180, .step_us = 60,  .home_deg = POSE_DOOR_CLOSED },
 };
 
+/* ---- Tasks and shared state ------------------------------------------- *
+ *
+ * Four FreeRTOS tasks (created in app_main), each with one job:
+ *
+ *   servo_task  core 1  prio 6  every 20 ms: slew the four servos one step toward their targets.
+ *                               The only code that touches MCPWM after init, and the most
+ *                               timing-sensitive, so it gets the highest priority.
+ *   anim_task   core 1  prio 5  every 20 ms: advance the talk and dispense state machines.
+ *   cmd_task    core 0  prio 5  read the UART, assemble lines, run handle_line().
+ *   tx_task     core 0  prio 3  the only code that writes the UART: drains reply_queue.
+ *
+ * The state machines and servo targets are shared, so every entry point takes state_lock (a
+ * RECURSIVE mutex: handle_line() holds it while calling move_*(), which take it again).
+ * reply() never blocks: it only pushes onto reply_queue, so a slow UART write can't stall the
+ * servo slewing or a state machine while the lock is held.
+ */
+#define TASK_PRIO_SERVO   6
+#define TASK_PRIO_ANIM    5
+#define TASK_PRIO_CMD     5
+#define TASK_PRIO_TX      3
+#define REPLY_LINE_MAX    160
+#define REPLY_QUEUE_LEN   16
+
+typedef struct { uint8_t len; char text[REPLY_LINE_MAX]; } reply_msg_t;
+
+static SemaphoreHandle_t state_lock;   /* guards servos[], mode, talk_*, dsp_* */
+static QueueHandle_t     reply_queue;  /* reply_msg_t, drained by tx_task */
+static TaskHandle_t      h_tx, h_cmd, h_servo, h_anim;  /* for the `tasks` diagnostic */
+
+#define LOCK()   xSemaphoreTakeRecursive(state_lock, portMAX_DELAY)
+#define UNLOCK() xSemaphoreGiveRecursive(state_lock)
+
 static uint32_t deg_to_us(const servo_t *s, float deg)
 {
     return s->min_us + (uint32_t)((deg / 180.0f) * (float)(s->max_us - s->min_us) + 0.5f);
@@ -292,21 +328,28 @@ static void servo_tick(servo_t *s)
 /* ---- The four movement functions -------------------------------------- */
 
 /* 1. head: any angle 0..180 (clamped). */
-void move_head(float deg)            { servo_set_angle(SERVO_HEAD, deg); }
+void move_head(float deg)            { LOCK(); servo_set_angle(SERVO_HEAD, deg); UNLOCK(); }
 
 /* 2. arm: any angle 0..180 (clamped). */
-void move_arm(float deg)             { servo_set_angle(SERVO_ARM, deg); }
+void move_arm(float deg)             { LOCK(); servo_set_angle(SERVO_ARM, deg); UNLOCK(); }
 
 /* 3. lazy susan: bin 1..4. Returns false for a bad bin number. */
 bool move_lazy_susan(int bin)
 {
     if (bin < 1 || bin > NUM_BINS) return false;
+    LOCK();
     servo_set_angle(SERVO_LAZY, POSE_BIN_DEG[bin - 1]);
+    UNLOCK();
     return true;
 }
 
 /* 4. trap door. */
-void move_trap_door(bool open)       { servo_set_angle(SERVO_DOOR, open ? POSE_DOOR_OPEN : POSE_DOOR_CLOSED); }
+void move_trap_door(bool open)
+{
+    LOCK();
+    servo_set_angle(SERVO_DOOR, open ? POSE_DOOR_OPEN : POSE_DOOR_CLOSED);
+    UNLOCK();
+}
 
 /* ---- MCPWM setup ------------------------------------------------------ */
 
@@ -379,7 +422,7 @@ void pwm_init(void)
  *
  *   mode:   MODE_RUN  (default) -- what the Pi drives
  *           MODE_TEST           -- adds raw per-servo angle commands
- *   Two independent state machines run in the same 20 ms loop, so head/arm
+ *   Two independent state machines (advanced by anim_task every 20 ms), so head/arm
  *   and lazy susan/door can move at the same time:
  *
  *   talk:      TALK_IDLE -> TALK_ACTIVE -> TALK_IDLE
@@ -416,17 +459,20 @@ static int32_t now_ms(void)
     return (int32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
 
+/* Never blocks and never touches the UART: pushes the line onto reply_queue for tx_task.
+ * If the queue is full the line is dropped (a lost status line beats a stalled servo). */
 static void reply(const char *fmt, ...)
 {
-    char buf[160];
+    reply_msg_t m;
     va_list ap;
     va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof(buf) - 2, fmt, ap);
+    int n = vsnprintf(m.text, sizeof(m.text) - 1, fmt, ap);
     va_end(ap);
     if (n < 0) return;
-    if (n > (int)sizeof(buf) - 3) n = sizeof(buf) - 3;
-    buf[n++] = '\n';
-    uart_write_bytes(UART_NUM, buf, n);
+    if (n > (int)sizeof(m.text) - 2) n = sizeof(m.text) - 2;
+    m.text[n++] = '\n';
+    m.len = (uint8_t)n;
+    xQueueSend(reply_queue, &m, 0);
 }
 
 /* End of a sentence (or `stop`): head and arm to rest. */
@@ -640,31 +686,80 @@ static void handle_line(char *line)
     if (!strcmp(cmd, "lazy")) { cmd_servo(SERVO_LAZY, arg); return; }
     if (!strcmp(cmd, "door")) { cmd_servo(SERVO_DOOR, arg); return; }
 
+    if (!strcmp(cmd, "tasks")) {
+        /* Smallest amount of stack each task has EVER had free, in bytes. Under ~512 means
+         * the stack is too small. Run it after exercising talk/dispense/status. */
+        reply("stack free: servo=%u anim=%u cmd=%u tx=%u  (heap free=%u)",
+              (unsigned)uxTaskGetStackHighWaterMark(h_servo), (unsigned)uxTaskGetStackHighWaterMark(h_anim),
+              (unsigned)uxTaskGetStackHighWaterMark(h_cmd),   (unsigned)uxTaskGetStackHighWaterMark(h_tx),
+              (unsigned)esp_get_free_heap_size());
+        return;
+    }
+
     reply("ERR unknown command '%s'", cmd);
 }
 
-/* ---- Main ------------------------------------------------------------- */
+/* ---- Tasks ------------------------------------------------------------ */
 
-void app_main(void)
+/* The only writer of the UART. */
+static void tx_task(void *arg)
 {
-    pwm_init();
-    uart_driver_install(UART_NUM, BUFFER_SIZE * 2, 0, 0, NULL, 0);
+    reply_msg_t m;
+    for (;;) {
+        if (xQueueReceive(reply_queue, &m, portMAX_DELAY) == pdTRUE) {
+            uart_write_bytes(UART_NUM, m.text, m.len);
+        }
+    }
+}
 
+/* Slews all four servos one step every control period. */
+static void servo_task(void *arg)
+{
+    TickType_t last_wake = xTaskGetTickCount();
+    for (;;) {
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CONTROL_PERIOD_MS));
+        LOCK();
+        for (int i = 0; i < SERVO_COUNT; i++) {
+            servo_tick(&servos[i]);
+        }
+        UNLOCK();
+    }
+}
+
+/* Advances the talk and dispense state machines every control period. */
+static void anim_task(void *arg)
+{
+    TickType_t last_wake = xTaskGetTickCount();
+    for (;;) {
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CONTROL_PERIOD_MS));
+        LOCK();
+        talk_tick();
+        dispense_tick();
+        UNLOCK();
+    }
+}
+
+/* Reads the UART, assembles command lines and runs them. */
+static void cmd_task(void *arg)
+{
     static char line[LINE_MAX_LEN];
     size_t len = 0;
     bool overflow = false;
     uint8_t chunk[64];
 
-    reply("Tubi ready (mode=run). Commands: status test run bin head arm door talk dispense stop");
-
-    while (1) {
-        /* Waits up to one control period for input, which also paces the loop. */
-        int got = uart_read_bytes(UART_NUM, chunk, sizeof(chunk), pdMS_TO_TICKS(CONTROL_PERIOD_MS));
+    for (;;) {
+        /* Returns after 10 ms even with a partial chunk, so short commands aren't held up. */
+        int got = uart_read_bytes(UART_NUM, chunk, sizeof(chunk), pdMS_TO_TICKS(10));
         for (int i = 0; i < got; i++) {
             char c = (char)chunk[i];
             if (c == '\n' || c == '\r') {
                 if (overflow)      reply("ERR line too long");
-                else if (len > 0) { line[len] = '\0'; handle_line(line); }
+                else if (len > 0) {
+                    line[len] = '\0';
+                    LOCK();
+                    handle_line(line);
+                    UNLOCK();
+                }
                 len = 0;
                 overflow = false;
             } else if (len < LINE_MAX_LEN - 1) {
@@ -673,11 +768,34 @@ void app_main(void)
                 overflow = true;
             }
         }
-
-        talk_tick();
-        dispense_tick();
-        for (int i = 0; i < SERVO_COUNT; i++) {
-            servo_tick(&servos[i]);
-        }
     }
+}
+
+static void start_task(TaskFunction_t fn, const char *name, uint32_t stack, UBaseType_t prio, BaseType_t core,
+                       TaskHandle_t *handle)
+{
+    if (xTaskCreatePinnedToCore(fn, name, stack, NULL, prio, handle, core) != pdPASS) {
+        ESP_LOGE(PWMTAG, "could not create task '%s'", name);
+        abort();  /* a missing task means a dead servo loop or a deaf board: fail loudly at boot */
+    }
+}
+
+/* ---- Main ------------------------------------------------------------- */
+
+void app_main(void)
+{
+    state_lock  = xSemaphoreCreateRecursiveMutex();
+    reply_queue = xQueueCreate(REPLY_QUEUE_LEN, sizeof(reply_msg_t));
+    configASSERT(state_lock != NULL && reply_queue != NULL);
+
+    pwm_init();
+    uart_driver_install(UART_NUM, BUFFER_SIZE * 2, 0, 0, NULL, 0);
+
+    reply("Tubi ready (mode=run). Commands: status test run bin head arm door talk dispense stop tasks");
+
+    start_task(tx_task,    "tx",    3072, TASK_PRIO_TX,    0, &h_tx);
+    start_task(cmd_task,   "cmd",   4096, TASK_PRIO_CMD,   0, &h_cmd);
+    start_task(servo_task, "servo", 3072, TASK_PRIO_SERVO, 1, &h_servo);
+    start_task(anim_task,  "anim",  3072, TASK_PRIO_ANIM,  1, &h_anim);
+    /* app_main returns; the four tasks run from here on. */
 }

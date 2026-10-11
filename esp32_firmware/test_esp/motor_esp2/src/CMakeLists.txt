@@ -7,5 +7,5 @@ FILE(GLOB_RECURSE app_sources ${CMAKE_SOURCE_DIR}/src/*.*)
 idf_component_register(
     SRCS "pwm.c"
     INCLUDE_DIRS "." 
-    REQUIRES driver log freertos esp_adc
+    REQUIRES driver log freertos esp_adc esp_driver_dac
 )

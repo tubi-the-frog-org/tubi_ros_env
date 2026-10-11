@@ -142,10 +142,14 @@ analyzer during debugging
 #include "esp_log.h"
 #include "adc.h"
 #include "pwm.h"
-
+#include "driver/dac_continuous.h"
+#include "driver/dac_types.h"
+#include "freertos/queue.h"
+#include "freertos/stream_buffer.h"
 #define UART_NUM UART_NUM_0
 #define BUFFER_SIZE 128
 static const char *uart_tag = "UART";
+static const char *dac_tag = "DAC";
 /* ---- Main ------------------------------------------------------------- */
 
 
@@ -168,9 +172,17 @@ static const char *PWMTAG = "PWM";
 #define TRAP_DOOR_CLOSE 1800 //starting the position
 #define TRAP_DOOR_OPEN  2400 //opening position??
 
+
+//slew rate control of servo/motor
 #define ESC_ARM_TIME_MS     2000              /* hold neutral at boot so the ESC arms */
 #define CONTROL_PERIOD_MS   20                /* one update per PWM period */
 #define RAMP_STEP_US        12                 /* 5 us / 20 ms -> 1000 us takes ~4 s */
+
+//DAC parameters for AUDIO
+#define DAC_FREQ_HZ   22050
+#define DAC_DESC_NUM  4
+#define DAC_BUF_SIZE  2048
+
 
 
 
@@ -236,7 +248,72 @@ mcpwm_timer_handle_t timer = NULL;
 mcpwm_oper_handle_t oper = NULL;
 mcpwm_cmpr_handle_t comparator = NULL;
 mcpwm_gen_handle_t generator = NULL;
+static dac_continuous_handle_t asynch_continous = NULL;
+static QueueHandle_t dac_evt_queue = NULL;
+StreamBufferHandle_t pcm_stream = NULL;   // decoder writes 8-bit unsigned PCM here....will need to explain this more!!
 
+// ISR: runs when the DMA finishes one buffer. Just forward the event.
+static bool IRAM_ATTR dac_on_convert_done(dac_continuous_handle_t handle,
+                                          const dac_event_data_t *event,
+                                          void *user_data)
+{
+    QueueHandle_t q = (QueueHandle_t)user_data;
+    BaseType_t woken = pdFALSE;
+    if (xQueueIsQueueFullFromISR(q)) {          // drop oldest if we fell behind
+        dac_event_data_t dummy;
+        xQueueReceiveFromISR(q, &dummy, &woken);
+    }
+    xQueueSendFromISR(q, event, &woken);
+    return woken == pdTRUE;
+}
+
+// Task: refill each finished buffer with PCM (or silence)
+static void dac_feed_task(void *arg)
+{
+    static uint8_t stage[DAC_BUF_SIZE];
+    dac_event_data_t evt;
+    while (1) {
+        xQueueReceive(dac_evt_queue, &evt, portMAX_DELAY);
+
+        size_t got = xStreamBufferReceive(pcm_stream, stage, evt.buf_size, 0);
+        if (got < evt.buf_size) {
+            memset(stage + got, 128, evt.buf_size - got);   // 128 = mid-scale silence
+        }
+
+        size_t loaded = 0;
+        dac_continuous_write_asynchronously(asynch_continous, evt.buf, evt.buf_size,
+                                            stage, evt.buf_size, &loaded);
+    }
+}
+
+void dac_init(void)
+{
+    dac_continuous_config_t cfg = {
+        .chan_mask = DAC_CHANNEL_MASK_CH0,       // GPIO25
+        .desc_num  = DAC_DESC_NUM,
+        .buf_size  = DAC_BUF_SIZE,
+        .freq_hz   = DAC_FREQ_HZ,
+        .offset    = 0,
+        .clk_src   = DAC_DIGI_CLK_SRC_DEFAULT,
+        .chan_mode = DAC_CHANNEL_MODE_SIMUL,
+    };
+    ESP_ERROR_CHECK(dac_continuous_new_channels(&cfg, &asynch_continous));
+
+    dac_evt_queue = xQueueCreate(DAC_DESC_NUM, sizeof(dac_event_data_t));
+    pcm_stream    = xStreamBufferCreate(16 * 1024, 1);
+
+    dac_event_callbacks_t cbs = {
+        .on_convert_done = dac_on_convert_done,
+        .on_stop = NULL,
+    };
+    ESP_ERROR_CHECK(dac_continuous_register_event_callback(asynch_continous, &cbs, dac_evt_queue));
+
+    ESP_ERROR_CHECK(dac_continuous_enable(asynch_continous));
+    ESP_ERROR_CHECK(dac_continuous_start_async_writing(asynch_continous));
+
+    xTaskCreate(dac_feed_task, "dac_feed", 4096, NULL, 6, NULL);
+    ESP_LOGI(dac_tag, "DAC running at %d Hz", DAC_FREQ_HZ);
+}
 void pwm_init(void){
         /* 1. Timer: default clock source is the 160 MHz PLL, divided down to 1 MHz */
     mcpwm_timer_config_t timer_config = {
@@ -301,11 +378,13 @@ void pwm_init(void){
 
 }
 
+
 uint32_t target_us = TRAP_DOOR_CLOSE;
 uint8_t ch;
 
 void app_main(void){
 pwm_init();
+dac_init();
 uart_driver_install(UART_NUM, BUFFER_SIZE * 2, 0, 0, NULL, 0);
     while (1) {
     if (uart_read_bytes(UART_NUM, &ch, 1, pdMS_TO_TICKS(CONTROL_PERIOD_MS)) > 0) {

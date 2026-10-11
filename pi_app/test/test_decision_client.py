@@ -159,9 +159,9 @@ def test_build_conversation_schema_shape():
     assert list(schema["properties"])[0] == "reasoning"  # reasons before it commits to scores
 
 
-def test_build_conversation_schema_force_done_locks_done():
-    schema = build_conversation_schema(["cookies", "chips"], force_done=True)
-    assert schema["properties"]["done"] == {"type": "boolean", "enum": [True]}
+def test_build_conversation_schema_does_not_force_a_reveal():
+    schema = build_conversation_schema(["cookies", "chips"])
+    assert schema["properties"]["done"] == {"type": "boolean"}
     assert schema["properties"]["snacks"]["items"]["enum"] == ["cookies", "chips"]
 
 

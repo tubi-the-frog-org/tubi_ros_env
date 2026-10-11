@@ -17,7 +17,7 @@ class StubDecisionClient:
         self._turns = list(turns)
         self.calls = 0
 
-    def converse(self, messages, snacks, force_done=False):
+    def converse(self, messages, snacks):
         turn = self._turns[min(self.calls, len(self._turns) - 1)]
         self.calls += 1
         return turn
@@ -287,9 +287,9 @@ async def test_guest_talking_over_tubi_is_heard_and_merged_into_one_turn(snacks_
     seen = []
     real_converse = decision_client.converse
 
-    def spy(messages, snacks, force_done=False):
+    def spy(messages, snacks):
         seen.append(messages[-1]["content"])
-        return real_converse(messages, snacks, force_done)
+        return real_converse(messages, snacks)
 
     decision_client.converse = spy
 

@@ -47,6 +47,12 @@ def test_set_slot_sends_bin_line():
     assert fake.writes == [b"bin 3\n"]
 
 
+def test_dispense_sends_dispense_line():
+    link, fake = _link_and_fake()
+    link.dispense(2)
+    assert fake.writes == [b"dispense 2\n"]
+
+
 def test_talk_sends_word_durations():
     link, fake = _link_and_fake()
     link.talk([200, 350, 150])
@@ -86,3 +92,4 @@ def test_null_link_does_nothing():
     link.close_trap_door()  # should not raise
     link.set_slot(1)
     link.talk([100])
+    link.dispense(1)

@@ -97,6 +97,8 @@ code/decisions that look like they contradict each other:
    the old single-byte `b'1'`/`b'2'` protocol in History #4 and `esp32_link.py` is gone. Per-word timings in
    `talk` are an estimate (audio bytes / 16000 B/s, split by word length). Pose angles in `pwm.c` are
    placeholders until tuned in test mode.
+   Two independent state machines (talk: head/arm; dispense: lazy susan/door) run in the same 20 ms loop. The reveal
+   is one command, `dispense <slot>`: rotate to the bin, open the door, hold, close — the ESP32 runs it itself.
 
 ## Measured facts about the Pi (do not assume otherwise)
 - Raspberry Pi 3, 905 MiB RAM, aarch64, Raspberry Pi OS (Debian trixie), hostname `max`, user `maxwelllokshin`,

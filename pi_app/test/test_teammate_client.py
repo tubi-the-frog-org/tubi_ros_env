@@ -39,6 +39,10 @@ class RecordingEspLink:
         self.closed = 0
         self.slots = []
         self.talks = []
+        self.dispensed = []
+
+    def dispense(self, slot):
+        self.dispensed.append(slot)
 
     def set_slot(self, slot):
         self.slots.append(slot)
@@ -113,8 +117,6 @@ def _client(snacks_store, turns, result_path, esp32_link=None, audio_player=None
         esp32_link or RecordingEspLink(),
         audio_player or RecordingAudioPlayer(),
         snacks_store,
-        dispense_open_seconds=0,
-        slot_settle_seconds=0,
         quiz_result_path=str(result_path),
     )
     return client, decision_client
@@ -169,8 +171,7 @@ async def test_reveal_sends_display_with_percentages_plays_audio_and_dispenses(s
 
     display_msgs = [m for m in ws.sent if m["type"] == "display"]
     assert display_msgs == [{"type": "display", "payload": {"kind": "result", "snacks": ["Chips"], "percentages": {"chips": 80.0, "none": 20.0}}}]
-    assert client._esp32_link.opened == 1
-    assert client._esp32_link.closed == 1
+    assert len(client._esp32_link.dispensed) == 1
     assert client._audio_player.played == [b"mp3-bytes", b"mp3-bytes"]  # intro + reveal
     assert client._session is None  # cleared after reveal
     saved = json.loads(result_path.read_text())

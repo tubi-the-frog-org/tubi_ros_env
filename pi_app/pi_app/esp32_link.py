@@ -2,6 +2,8 @@
 
 The firmware reads ONE text command per line off UART0 at 115200 baud
 (see the protocol comment at the top of its pwm.c):
+    dispense <1-4>        the final decision: rotate to that bin, then the
+                          trap door opens and closes quickly, on its own
     bin <1-4>             lazy susan to that bin
     door open | close     trap door
     talk <ms> <ms> ...    per-word durations; the ESP32 bobs the head up/down
@@ -55,6 +57,10 @@ class EspLink(ABC):
     def talk(self, word_ms: list[int]) -> None:
         """Start the head/arm talking animation; returns immediately."""
 
+    @abstractmethod
+    def dispense(self, slot: int) -> None:
+        """Rotate to bin `slot` (1-4), open and close the trap door; returns immediately."""
+
 
 class NullEspLink(EspLink):
     """No-op link for dev/test when no ESP32 is attached."""
@@ -69,6 +75,9 @@ class NullEspLink(EspLink):
         pass
 
     def talk(self, word_ms: list[int]) -> None:
+        pass
+
+    def dispense(self, slot: int) -> None:
         pass
 
 
@@ -96,6 +105,9 @@ class SerialEspLink(EspLink):
 
     def set_slot(self, slot: int) -> None:
         self._send(f"bin {slot}")
+
+    def dispense(self, slot: int) -> None:
+        self._send(f"dispense {slot}")
 
     def talk(self, word_ms: list[int]) -> None:
         if word_ms:

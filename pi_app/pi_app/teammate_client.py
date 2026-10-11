@@ -37,8 +37,6 @@ from pi_app.snacks import SnacksStore
 from pi_app.tts_client import TtsClient, TtsError
 
 RECONNECT_DELAY_S = 3.0
-DISPENSE_OPEN_SECONDS = 4.0
-SLOT_SETTLE_SECONDS = 3.0  # time for the lazy susan to reach its bin before the door opens
 QUIZ_RESULT_PATH = "tools/quiz_result.json"
 _BUDGET_EXHAUSTED_REPLY = "The mists are resting a moment... try again shortly, traveler."
 
@@ -55,8 +53,6 @@ class TeammateClient:
         audio_player: AudioPlayer,
         snacks_store: SnacksStore,
         reconnect_delay_s: float = RECONNECT_DELAY_S,
-        dispense_open_seconds: float = DISPENSE_OPEN_SECONDS,
-        slot_settle_seconds: float = SLOT_SETTLE_SECONDS,
         quiz_result_path: str = QUIZ_RESULT_PATH,
         logger: logging.Logger | None = None,
     ):
@@ -69,8 +65,6 @@ class TeammateClient:
         self._audio_player = audio_player
         self._snacks_store = snacks_store
         self._reconnect_delay_s = reconnect_delay_s
-        self._dispense_open_seconds = dispense_open_seconds
-        self._slot_settle_seconds = slot_settle_seconds
         self._quiz_result_path = quiz_result_path
         self._logger = logger or logging.getLogger(__name__)
         self._session: ConversationSession | None = None
@@ -104,12 +98,14 @@ class TeammateClient:
 
         if msg_type == "session:start":
             session_id = payload.get("sessionId") or str(uuid.uuid4())
+            self._logger.info(f"session:start {session_id}")
             self._session = ConversationSession(session_id, self._decision_client, self._snacks_store.current)
             reply = await self._run_llm(self._session.start)
             await self._speak_turn(ws, reply)
             return
 
         if msg_type == "session:end":
+            self._logger.info("session:end")
             self._session = None
             return
 
@@ -124,6 +120,7 @@ class TeammateClient:
         if not text or not text.strip():
             return
 
+        self._logger.info(f"guest said: {text!r}")
         session = self._session
         reply = await self._run_llm(lambda: session.respond(text))
         await self._speak_turn(ws, reply)
@@ -145,6 +142,7 @@ class TeammateClient:
         return await loop.run_in_executor(None, fn)
 
     async def _speak_turn(self, ws, text: str):
+        self._logger.info(f"Tubi says: {text!r}")
         await ws.send_json({"type": "speak", "payload": {"text": text}})
         try:
             await self._synthesize_and_play(ws, text)
@@ -183,18 +181,16 @@ class TeammateClient:
             },
         })
 
-        # Only one physical mechanism exists right now (one trap door, no
-        # per-slot routing -- see esp32_link.py), so every reveal just
-        # pulses it open then closed once, regardless of how many snacks
-        # were chosen digitally (the firmware can't dispense more than one).
-        loop = asyncio.get_running_loop()
+        # The ESP32 runs the whole sequence itself (rotate to the bin, open
+        # the trap door, close it), so this is one command. Only one funnel
+        # can be targeted, so the first chosen snack's slot wins even when
+        # several snacks scored high enough to be named.
         slot = result.chosen_snacks[0].slot
         if 1 <= slot <= 4:
-            await loop.run_in_executor(None, self._esp32_link.set_slot, slot)
-            await asyncio.sleep(self._slot_settle_seconds)
-        await loop.run_in_executor(None, self._esp32_link.open_trap_door)
-        await asyncio.sleep(self._dispense_open_seconds)
-        await loop.run_in_executor(None, self._esp32_link.close_trap_door)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._esp32_link.dispense, slot)
+        else:
+            self._logger.warning(f"chosen snack has no valid bin (slot={slot}); not dispensing")
 
         try:
             with open(self._quiz_result_path, "w") as f:

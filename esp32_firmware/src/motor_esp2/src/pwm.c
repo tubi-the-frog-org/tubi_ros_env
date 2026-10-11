@@ -124,8 +124,8 @@ analyzer during debugging
  *   servo      GPIO   job
  *   HEAD       5      bobs up at the start of every spoken word, down at the end
  *   ARM        18     up/down gesture
- *   LAZY SUSAN 19     positional servo, 4 bins
- *   TRAP DOOR  32     closed / open
+ *   LAZY SUSAN 21     positional servo, 4 bins
+ *   TRAP DOOR  19     closed / open
  *   Share GND between the servo supply and the ESP32.
  *
  * One timer feeds two operators; each operator has two comparator/generator
@@ -146,16 +146,25 @@ analyzer during debugging
  *     talk <ms> <ms> ...      one entry per word: that word's duration in ms.
  *                             Head AND arm go up when each word starts and dip
  *                             back down before it ends. After the last word
- *                             the head drops but the arm STAYS UP (use
- *                             "arm down" or "stop" to lower it). Runs by itself -- no serial traffic
- *                             between words, so no timing jitter.
- *     stop                    abort a talk, head AND arm back to rest
+ *                             both end in their rest (down) position. Runs by
+ *                             itself -- no serial traffic between words, so no
+ *                             timing jitter.
+ *     dispense <1-4>          the final decision: lazy susan rotates to that
+ *                             bin, then the trap door opens, stays open for
+ *                             DOOR_HOLD_MS and closes. Runs by itself, at the
+ *                             same time as a talk (separate servos). Replies
+ *                             "OK dispense done" when finished.
+ *     stop                    abort talk AND dispense; head/arm to rest, door closes
  *
  *   TEST mode only (find out how far each servo should go):
  *     head <deg>   arm <deg>   lazy <deg>   door <deg>
  *     deg is 0..180, clamped to that servo's safe limits (see servos[]).
  *     Type e.g. "head 105", look at the linkage, repeat. Then copy the numbers
  *     into the POSE_* constants below.
+ *     Lazy susan: find the angle of each funnel (lazy 20, lazy 55, ...), copy
+ *     them into POSE_BIN1..4_DEG, then check with "bin 1".."bin 4".
+ *     Trap door:  find the closed and open angles, copy them into
+ *     POSE_DOOR_CLOSED / POSE_DOOR_OPEN, then check with "door open|close".
  */
 
 #include <stdarg.h>
@@ -203,6 +212,12 @@ static const float POSE_BIN_DEG[NUM_BINS] = {
     POSE_BIN1_DEG, POSE_BIN2_DEG, POSE_BIN3_DEG, POSE_BIN4_DEG,
 };
 
+/* Dispense timing (ms). Servo "arrived" means the commanded position was
+ * reached; real servos lag a little, so we wait a bit longer. */
+#define LAZY_SETTLE_MS      300               /* after the lazy susan arrives, before the door opens */
+#define DOOR_HOLD_MS        400               /* door stays open this long (snack drops) */
+#define DOOR_SETTLE_MS      200               /* after the door closes, before reporting done */
+
 /* While talking: head is up for this fraction of each word, then drops. */
 #define TALK_UP_FRACTION    0.6f
 #define TALK_MAX_WORDS      64
@@ -229,10 +244,10 @@ static servo_t servos[SERVO_COUNT] = {
                      .min_deg = 60,  .max_deg = 150, .step_us = 100, .home_deg = POSE_HEAD_DOWN },
     [SERVO_ARM]  = { .name = "arm",  .gpio = GPIO_NUM_18, .min_us = 500, .max_us = 2500,
                      .min_deg = 0,   .max_deg = 180, .step_us = 120, .home_deg = POSE_ARM_DOWN },
-    [SERVO_LAZY] = { .name = "lazy", .gpio = GPIO_NUM_19, .min_us = 500, .max_us = 2500,
-                     .min_deg = 0,   .max_deg = 180, .step_us = 25,  .home_deg = POSE_BIN1_DEG },
-    [SERVO_DOOR] = { .name = "door", .gpio = GPIO_NUM_32, .min_us = 500, .max_us = 2500,
-                     .min_deg = 90,  .max_deg = 180, .step_us = 12,  .home_deg = POSE_DOOR_CLOSED },
+    [SERVO_LAZY] = { .name = "lazy", .gpio = GPIO_NUM_21, .min_us = 500, .max_us = 2500,
+                     .min_deg = 0,   .max_deg = 180, .step_us = 40,  .home_deg = POSE_BIN1_DEG },
+    [SERVO_DOOR] = { .name = "door", .gpio = GPIO_NUM_19, .min_us = 500, .max_us = 2500,
+                     .min_deg = 0,   .max_deg = 180, .step_us = 60,  .home_deg = POSE_DOOR_CLOSED },
 };
 
 static uint32_t deg_to_us(const servo_t *s, float deg)
@@ -355,19 +370,31 @@ void pwm_init(void)
  *
  *   mode:   MODE_RUN  (default) -- what the Pi drives
  *           MODE_TEST           -- adds raw per-servo angle commands
- *   state:  ST_IDLE
- *           ST_TALKING -- stepping through the per-word schedule
+ *   Two independent state machines run in the same 20 ms loop, so head/arm
+ *   and lazy susan/door can move at the same time:
  *
- *   TALKING, per word:  [word starts] head UP --(TALK_UP_FRACTION)--> head
- *   DOWN --(rest of word)--> next word starts. After the last word: head and
- *   arm down, back to IDLE. `stop` does the same early.
+ *   talk:      TALK_IDLE -> TALK_ACTIVE -> TALK_IDLE
+ *     per word: [word starts] head UP, arm UP --(TALK_UP_FRACTION)--> head
+ *     DOWN, arm dips --(rest of word)--> next word starts. After the last
+ *     word: head and arm to rest.
+ *
+ *   dispense:  DSP_IDLE -> DSP_ROTATING -> DSP_OPENING -> DSP_CLOSING -> DSP_IDLE
+ *     ROTATING: door closed, lazy susan moves to the bin; wait until it has
+ *               arrived + LAZY_SETTLE_MS.
+ *     OPENING:  door opens; wait until open + DOOR_HOLD_MS.
+ *     CLOSING:  door closes; wait until closed + DOOR_SETTLE_MS, then done.
+ *
+ *   `stop` aborts both.
  */
 
 typedef enum { MODE_RUN, MODE_TEST } mode_t_;
-typedef enum { ST_IDLE, ST_TALKING } state_t_;
+typedef enum { TALK_IDLE, TALK_ACTIVE } talk_state_t;
+typedef enum { DSP_IDLE, DSP_ROTATING, DSP_OPENING, DSP_CLOSING } dispense_state_t;
 
-static mode_t_  mode  = MODE_RUN;
-static state_t_ state = ST_IDLE;
+static mode_t_          mode        = MODE_RUN;
+static talk_state_t     talk_state  = TALK_IDLE;
+static dispense_state_t dsp_state   = DSP_IDLE;
+static int32_t          dsp_arrived_ms = -1;   /* when the current step's servo reached its target */
 
 static uint32_t talk_ms[TALK_MAX_WORDS];
 static int      talk_count = 0;
@@ -393,19 +420,12 @@ static void reply(const char *fmt, ...)
     uart_write_bytes(UART_NUM, buf, n);
 }
 
-/* Natural end of a sentence: head drops, arm stays up. */
+/* End of a sentence (or `stop`): head and arm to rest. */
 static void talk_finish(void)
 {
-    state = ST_IDLE;
+    talk_state = TALK_IDLE;
     talk_head_up = false;
     move_head(POSE_HEAD_DOWN);
-    move_arm(POSE_ARM_UP);
-}
-
-/* `stop` command: everything back to rest. */
-static void talk_stop(void)
-{
-    talk_finish();
     move_arm(POSE_ARM_DOWN);
 }
 
@@ -419,22 +439,21 @@ static void talk_begin_word(void)
 
 static void talk_start(void)
 {
-    state = ST_TALKING;
+    talk_state = TALK_ACTIVE;
     talk_idx = 0;
     talk_begin_word();
 }
 
-/* Called every control period. */
-static void state_tick(void)
+static void talk_tick(void)
 {
-    if (state != ST_TALKING) return;
+    if (talk_state != TALK_ACTIVE) return;
     if ((int32_t)(now_ms() - talk_next_event_ms) < 0) return;
 
     if (talk_head_up) {
         /* Head drops at the end of the word; next word starts after the remainder. */
         move_head(POSE_HEAD_DOWN);
-        /* The last word keeps the arm up; every other word dips it. */
-        if (talk_idx < talk_count - 1) move_arm(POSE_ARM_WORD_LOW);
+        /* Every word dips the arm; the last word goes straight to rest. */
+        move_arm(talk_idx < talk_count - 1 ? POSE_ARM_WORD_LOW : POSE_ARM_DOWN);
         talk_head_up = false;
         talk_next_event_ms += (int32_t)(talk_ms[talk_idx] * (1.0f - TALK_UP_FRACTION));
     } else {
@@ -445,6 +464,70 @@ static void state_tick(void)
         } else {
             talk_begin_word();
         }
+    }
+}
+
+/* ---- Dispense state machine ------------------------------------------- */
+
+static bool servo_at_target(servo_id_t id)
+{
+    return servos[id].current_us == servos[id].target_us;
+}
+
+/* True once the servo has been at its target for settle_ms. */
+static bool servo_settled(servo_id_t id, uint32_t settle_ms)
+{
+    if (!servo_at_target(id)) {
+        dsp_arrived_ms = -1;
+        return false;
+    }
+    if (dsp_arrived_ms < 0) dsp_arrived_ms = now_ms();
+    return (int32_t)(now_ms() - dsp_arrived_ms) >= (int32_t)settle_ms;
+}
+
+static void dispense_enter(dispense_state_t next)
+{
+    dsp_state = next;
+    dsp_arrived_ms = -1;
+    switch (next) {
+    case DSP_OPENING: move_trap_door(true);  break;
+    case DSP_CLOSING: move_trap_door(false); break;
+    default: break;
+    }
+}
+
+static void dispense_start(int bin)
+{
+    move_trap_door(false);          /* make sure it is shut while the tray turns */
+    move_lazy_susan(bin);
+    dispense_enter(DSP_ROTATING);
+    dsp_arrived_ms = -1;
+}
+
+static void dispense_abort(void)
+{
+    dsp_state = DSP_IDLE;
+    move_trap_door(false);
+    servos[SERVO_LAZY].target_us = servos[SERVO_LAZY].current_us;   /* halt the tray where it is */
+}
+
+static void dispense_tick(void)
+{
+    switch (dsp_state) {
+    case DSP_IDLE:
+        break;
+    case DSP_ROTATING:
+        if (servo_settled(SERVO_LAZY, LAZY_SETTLE_MS)) dispense_enter(DSP_OPENING);
+        break;
+    case DSP_OPENING:
+        if (servo_settled(SERVO_DOOR, DOOR_HOLD_MS)) dispense_enter(DSP_CLOSING);
+        break;
+    case DSP_CLOSING:
+        if (servo_settled(SERVO_DOOR, DOOR_SETTLE_MS)) {
+            dsp_state = DSP_IDLE;
+            reply("OK dispense done");
+        }
+        break;
     }
 }
 
@@ -462,7 +545,10 @@ static bool parse_float(const char *tok, float *out)
 
 static void cmd_status(void)
 {
-    reply("mode=%s state=%s", mode == MODE_TEST ? "test" : "run", state == ST_TALKING ? "talking" : "idle");
+    reply("mode=%s talk=%s dispense=%s", mode == MODE_TEST ? "test" : "run",
+          talk_state == TALK_ACTIVE ? "active" : "idle",
+          dsp_state == DSP_IDLE ? "idle" : dsp_state == DSP_ROTATING ? "rotating"
+                                : dsp_state == DSP_OPENING ? "opening" : "closing");
     for (int i = 0; i < SERVO_COUNT; i++) {
         reply("  %-4s %6.1f deg  %4u us (target %4u us)  limits %.0f-%.0f deg",
               servos[i].name, us_to_deg(&servos[i], servos[i].current_us),
@@ -504,7 +590,17 @@ static void handle_line(char *line)
     if (!strcmp(cmd, "test")) { mode = MODE_TEST; reply("OK mode=test"); return; }
     if (!strcmp(cmd, "run"))  { mode = MODE_RUN;  reply("OK mode=run");  return; }
 
-    if (!strcmp(cmd, "stop")) { talk_stop(); reply("OK stopped"); return; }
+    if (!strcmp(cmd, "stop")) { talk_finish(); dispense_abort(); reply("OK stopped"); return; }
+
+    if (!strcmp(cmd, "dispense")) {
+        char *arg = strtok_r(NULL, " \t", &save);
+        int bin = arg ? atoi(arg) : 0;
+        if (bin < 1 || bin > NUM_BINS)  { reply("ERR dispense needs a bin 1..%d", NUM_BINS); return; }
+        if (dsp_state != DSP_IDLE)      { reply("ERR dispense busy"); return; }
+        dispense_start(bin);
+        reply("OK dispense bin %d", bin);
+        return;
+    }
 
     if (!strcmp(cmd, "bin") || !strcmp(cmd, "slot")) {
         char *arg = strtok_r(NULL, " \t", &save);
@@ -550,7 +646,7 @@ void app_main(void)
     bool overflow = false;
     uint8_t chunk[64];
 
-    reply("Tubi ready (mode=run). Commands: status test run bin head arm door talk stop");
+    reply("Tubi ready (mode=run). Commands: status test run bin head arm door talk dispense stop");
 
     while (1) {
         /* Waits up to one control period for input, which also paces the loop. */
@@ -569,7 +665,8 @@ void app_main(void)
             }
         }
 
-        state_tick();
+        talk_tick();
+        dispense_tick();
         for (int i = 0; i < SERVO_COUNT; i++) {
             servo_tick(&servos[i]);
         }

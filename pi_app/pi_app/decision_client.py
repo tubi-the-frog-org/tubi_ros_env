@@ -41,7 +41,7 @@ _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
 
-SYSTEM_PROMPT_TEMPLATE = """
+_SYSTEM_PROMPT_TEMPLATE = """
 You are Tubi. You're an ancient wizard frog who lives somewhere deep in a mystical swamp.
 
 PERSONALITY

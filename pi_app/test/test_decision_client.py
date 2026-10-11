@@ -155,7 +155,8 @@ def test_build_conversation_schema_shape():
     assert schema["properties"]["snacks"] == {"type": "array", "items": {"type": "string", "enum": ["cookies", "chips"]}}
     assert schema["properties"]["done"] == {"type": "boolean"}
     assert set(schema["properties"]["percentages"]["properties"]) == {"cookies", "chips"}
-    assert schema["required"] == ["done", "snacks", "reply", "percentages"]
+    assert schema["required"] == ["reasoning", "done", "snacks", "reply", "percentages"]
+    assert list(schema["properties"])[0] == "reasoning"  # reasons before it commits to scores
 
 
 def test_build_conversation_schema_force_done_locks_done():
@@ -274,3 +275,31 @@ def test_converse_bad_json_content_raises():
         client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
         with pytest.raises(DecisionInvalidResponseError):
             client.converse(_history(), SNACKS)
+
+
+def test_converse_returns_private_reasoning_and_accepts_it_missing():
+    with FakeDecisionServer(responses=[
+        {"status": 200, "content": json.dumps({**json.loads(_not_done_content()), "reasoning": "Opened the door: curious."})},
+        {"status": 200, "content": _not_done_content()},  # an older/other model that omits it
+    ]) as server:
+        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
+        assert client.converse(_history(), SNACKS).reasoning == "Opened the door: curious."
+        assert client.converse(_history(), SNACKS).reasoning == ""
+
+
+def test_converse_done_accepts_a_reveal_that_ties_the_pick_to_an_answer():
+    # The prompt's own example reveal is 161 chars; the old 160 cap rejected it.
+    reply = ("WAZAH! You'd rather study ancient history than predict the future? "
+             "Take Chips and the Cookies too. Baked according to a simple, timeless alchemy from centuries past!")
+    assert 160 < len(reply) < 280
+    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(reply=reply)}]) as server:
+        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
+        assert client.converse(_history(), SNACKS).done is True
+
+
+def test_system_prompt_lists_each_snacks_vibe_and_scratchpad_rule():
+    snacks = [Snack(id="chips", label="Chips", slot=3, tags=["salty"], vibe="grounded and dry", lines=[])]
+    prompt = build_system_prompt(snacks)
+    assert "vibe: grounded and dry" in prompt
+    assert '"reasoning"' in prompt
+    assert "(no speech detected)" in prompt

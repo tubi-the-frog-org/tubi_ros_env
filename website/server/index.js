@@ -29,6 +29,8 @@ const resetTranscriptFile = () => {
   writeFileSync(transcriptOutputPath, '', 'utf8');
 };
 
+// Must match the exact string in pi_app's system prompt (decision_client.py).
+const NO_SPEECH_MARKER = '(no speech detected)';
 const STT_FAILURE_TEXT = /^(Speech transcription failed|No audio|I could not understand the audio)/;
 
 // Speech-to-text. With STT_API_KEY (or LLM_API_KEY) set, audio goes to an
@@ -324,9 +326,12 @@ app.post('/api/transcribe', async (req, res) => {
     const text = result.text || 'I did not catch that clearly.';
     appendTranscriptFile(text);
     // stt_worker.py reports its own failures as plain text; don't feed those to Tubi.
-    if (result.text && !STT_FAILURE_TEXT.test(result.text)) {
+    // An empty result (nothing but silence/noise) IS forwarded, as a marker the
+    // system prompt knows to answer with "what was that?" instead of leaving the
+    // guest in dead air with a locked-out button.
+    if (!STT_FAILURE_TEXT.test(result.text ?? '')) {
       if (teammateConnected()) setTubiBusy(true);
-      toTeammate('transcript', { text: result.text, isFinal: true, timestamp: Date.now() });
+      toTeammate('transcript', { text: result.text || NO_SPEECH_MARKER, isFinal: true, timestamp: Date.now() });
     }
     res.json({ ok: true, text });
   } catch (error) {

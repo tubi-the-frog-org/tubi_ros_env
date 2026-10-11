@@ -25,6 +25,7 @@ class Snack:
     slot: int
     aliases: list[str] = field(default_factory=list)
     tags: list[str] = field(default_factory=list)
+    vibe: str = ""  # the kind of person this snack suits; what the decision call matches answers against
     lines: list[Line] = field(default_factory=list)
 
 
@@ -79,6 +80,9 @@ def _parse_snack(raw: object, index: int) -> Snack:
     tags = raw.get("tags", [])
     _require(isinstance(tags, list) and all(isinstance(t, str) for t in tags), f"snack '{snack_id}'.tags must be a list of strings")
 
+    vibe = raw.get("vibe", "")
+    _require(isinstance(vibe, str), f"snack '{snack_id}'.vibe must be a string")
+
     lines_raw = raw.get("lines", [])
     _require(isinstance(lines_raw, list) and len(lines_raw) > 0, f"snack '{snack_id}'.lines must be a non-empty list")
     lines = [_parse_line(line, snack_id, i) for i, line in enumerate(lines_raw)]
@@ -89,6 +93,7 @@ def _parse_snack(raw: object, index: int) -> Snack:
         slot=slot,
         aliases=aliases,
         tags=tags,
+        vibe=vibe,
         lines=lines,
     )
 

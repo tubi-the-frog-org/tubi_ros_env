@@ -168,7 +168,7 @@ def test_forced_reveal_that_still_fails_finalizes_locally_instead_of_looping():
     # +1 for start()'s own turn; then enough not_done turns to cross the hard
     # limit, then a DecisionError on the forced-done attempt itself (e.g. the
     # model said done=true but snack="undecided" even with done locked true).
-    turns = [_not_done(f"Question {i}") for i in range(9)] + [DecisionError("done=true but snack is undecided")]
+    turns = [_not_done(f"Question {i}") for i in range(_FORCE_AFTER_TURNS + 1)] + [DecisionError("done=true but snack is undecided")]
     client = StubDecisionClient(turns)
     session = ConversationSession("s1", client, SNACKS)
     session.start()
@@ -188,7 +188,7 @@ def test_forced_reveal_that_still_fails_finalizes_locally_instead_of_looping():
 
 def test_force_done_turn_that_comes_back_done_finalizes_normally():
     # +1 for start()'s own turn, which doesn't count toward the question limit
-    turns = [_not_done(f"Question {i}") for i in range(9)] + [_done(snack_ids=("chips",))]
+    turns = [_not_done(f"Question {i}") for i in range(_FORCE_AFTER_TURNS + 1)] + [_done(snack_ids=("chips",))]
     client = StubDecisionClient(turns)
     session = ConversationSession("s1", client, SNACKS)
     session.start()

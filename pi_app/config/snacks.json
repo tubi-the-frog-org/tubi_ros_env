@@ -24,7 +24,8 @@
           "id": "cookies_2",
           "text": "The crystal ball glimmers warm and golden... M&M await."
         }
-      ]
+      ],
+      "vibe": "playful, spontaneous and social; bright, a little chaotic, goes for the fun option, loves surprises and sharing"
     },
     {
       "id": "popcorn",
@@ -49,7 +50,8 @@
           "id": "candy_2",
           "text": "Sugar and starlight... candy, traveler!"
         }
-      ]
+      ],
+      "vibe": "cozy, easygoing storyteller; loves a good show or adventure, enjoys the experience more than the outcome, warm and relaxed"
     },
     {
       "id": "pretzels",
@@ -71,12 +73,13 @@
           "id": "chips_2",
           "text": "Salt on the wind carries a sign... chips it is."
         }
-      ]
+      ],
+      "vibe": "grounded, practical and a bit dry; no-nonsense, likes the classic tried-and-true choice, skeptical, quietly dependable"
     },
     {
       "id": "goldfish",
       "label": "goldfish",
-      "slot": 3,
+      "slot": 4,
       "aliases": [
         "crisps"
       ],
@@ -93,7 +96,8 @@
           "id": "chips_2",
           "text": "Salt on the wind carries a sign... chips it is."
         }
-      ]
+      ],
+      "vibe": "curious, whimsical and a little nostalgic; thoughtful daydreamer who likes small clever things and wandering into the unknown"
     },
     {
       "id": "none",

@@ -74,8 +74,9 @@ _START_PROMPT = (
 # So the question count is tracked and enforced in code, with two rungs:
 # a nudge first (model still has a say), then a structurally-forced reveal
 # (it doesn't) if that didn't work.
-_NUDGE_AFTER_TURNS = 6
-_FORCE_AFTER_TURNS = 8
+# Turn 1 is the guest's name, turns 2-5 answer the four questions -> reveal on turn 5.
+_NUDGE_AFTER_TURNS = 5
+_FORCE_AFTER_TURNS = 7
 _WRAP_UP_NUDGE = (
     "(Internal note, not from the guest -- you've asked enough questions now. You have enough information to "
     "decide. Do not ask any more questions -- set done=true this turn, choose whichever snack(s) genuinely "

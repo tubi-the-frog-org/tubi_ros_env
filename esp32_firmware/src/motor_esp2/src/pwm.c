@@ -122,9 +122,8 @@ analyzer during debugging
  * Board: DOIT ESP32 DEVKIT V1 (ESP32-D0WD-V3)
  *
  *   servo      GPIO   job
- *   HEAD       32     bobs up at the start of every spoken word, down at the end
- *   ARM        35     up/down gesture  (!! GPIO35 is INPUT-ONLY on the ESP32: it cannot drive a servo.
- *                              pwm_init() skips it with an error log. Move the wire to an output pin, e.g. 33.)
+ *   HEAD       23     bobs up at the start of every spoken word, down at the end
+ *   ARM        22     up/down gesture (GPIO34-39 are input-only and can't drive a servo; don't use those)
  *   LAZY SUSAN 21     positional servo, 4 bins
  *   TRAP DOOR  19     closed / open
  *   Share GND between the servo supply and the ESP32.
@@ -241,9 +240,9 @@ typedef struct {
 } servo_t;
 
 static servo_t servos[SERVO_COUNT] = {
-    [SERVO_HEAD] = { .name = "head", .gpio = GPIO_NUM_32, .min_us = 500, .max_us = 2500,
+    [SERVO_HEAD] = { .name = "head", .gpio = GPIO_NUM_23, .min_us = 500, .max_us = 2500,
                      .min_deg = 60,  .max_deg = 150, .step_us = 100, .home_deg = POSE_HEAD_DOWN },
-    [SERVO_ARM]  = { .name = "arm",  .gpio = GPIO_NUM_35, .min_us = 500, .max_us = 2500,
+    [SERVO_ARM]  = { .name = "arm",  .gpio = GPIO_NUM_22, .min_us = 500, .max_us = 2500,
                      .min_deg = 0,   .max_deg = 180, .step_us = 120, .home_deg = POSE_ARM_DOWN },
     [SERVO_LAZY] = { .name = "lazy", .gpio = GPIO_NUM_21, .min_us = 500, .max_us = 2500,
                      .min_deg = 0,   .max_deg = 180, .step_us = 40,  .home_deg = POSE_BIN1_DEG },

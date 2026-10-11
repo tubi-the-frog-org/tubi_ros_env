@@ -256,13 +256,20 @@ def main():
     )
 
     # Speech goes to the ESP32's DAC when AUDIO_SERIAL_PORT is set, else out of the Pi's own speaker.
-    audio_player = (
-        Esp32AudioPlayer(audio_port, bytes_per_second=tts_client.bytes_per_second)
-        if audio_port else AudioPlayer()
-    )
+    audio_player = AudioPlayer()
+    if audio_port:
+        try:
+            audio_player = Esp32AudioPlayer(audio_port, bytes_per_second=tts_client.bytes_per_second)
+        except (OSError, ValueError) as e:  # serial.SerialException is an OSError
+            logging.error(f"could not open AUDIO_SERIAL_PORT {audio_port} ({e}); falling back to the Pi's own speaker")
 
     esp32_port = os.environ.get("ESP32_SERIAL_PORT") # opening the port
-    esp32_link = SerialEspLink(esp32_port) if esp32_port else NullEspLink() # link the serial port of esp
+    esp32_link = NullEspLink()
+    if esp32_port:  # link the serial port of the motor ESP32
+        try:
+            esp32_link = SerialEspLink(esp32_port)
+        except (OSError, ValueError) as e:
+            logging.error(f"could not open ESP32_SERIAL_PORT {esp32_port} ({e}); running with NO head/arm/door motion")
 
     client = TeammateClient( # this is the conversational part
         ws_url=os.environ.get("WEBSITE_WS_URL", "ws://localhost:3000/?role=teammate"),

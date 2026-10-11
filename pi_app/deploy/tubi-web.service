@@ -1,7 +1,8 @@
 [Unit]
 Description=Tubi website (Express + WebSocket hub)
-After=network-online.target
-Wants=network-online.target
+# No network-online dependency: the site is local, and waiting for it can stall startup for a minute
+# (e.g. with an Ethernet cable plugged in and no DHCP server).
+After=network.target
 
 [Service]
 User=maxwelllokshin

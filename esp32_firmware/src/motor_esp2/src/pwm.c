@@ -122,8 +122,9 @@ analyzer during debugging
  * Board: DOIT ESP32 DEVKIT V1 (ESP32-D0WD-V3)
  *
  *   servo      GPIO   job
- *   HEAD       5      bobs up at the start of every spoken word, down at the end
- *   ARM        18     up/down gesture
+ *   HEAD       32     bobs up at the start of every spoken word, down at the end
+ *   ARM        35     up/down gesture  (!! GPIO35 is INPUT-ONLY on the ESP32: it cannot drive a servo.
+ *                              pwm_init() skips it with an error log. Move the wire to an output pin, e.g. 33.)
  *   LAZY SUSAN 21     positional servo, 4 bins
  *   TRAP DOOR  19     closed / open
  *   Share GND between the servo supply and the ESP32.
@@ -240,9 +241,9 @@ typedef struct {
 } servo_t;
 
 static servo_t servos[SERVO_COUNT] = {
-    [SERVO_HEAD] = { .name = "head", .gpio = GPIO_NUM_5 , .min_us = 500, .max_us = 2500,
+    [SERVO_HEAD] = { .name = "head", .gpio = GPIO_NUM_32, .min_us = 500, .max_us = 2500,
                      .min_deg = 60,  .max_deg = 150, .step_us = 100, .home_deg = POSE_HEAD_DOWN },
-    [SERVO_ARM]  = { .name = "arm",  .gpio = GPIO_NUM_18, .min_us = 500, .max_us = 2500,
+    [SERVO_ARM]  = { .name = "arm",  .gpio = GPIO_NUM_35, .min_us = 500, .max_us = 2500,
                      .min_deg = 0,   .max_deg = 180, .step_us = 120, .home_deg = POSE_ARM_DOWN },
     [SERVO_LAZY] = { .name = "lazy", .gpio = GPIO_NUM_21, .min_us = 500, .max_us = 2500,
                      .min_deg = 0,   .max_deg = 180, .step_us = 40,  .home_deg = POSE_BIN1_DEG },
@@ -343,6 +344,15 @@ void pwm_init(void)
         s->current_us = deg_to_us(s, s->home_deg);
         s->target_us  = s->current_us;
         ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(s->cmpr, s->current_us));
+
+        /* Input-only pins (GPIO34-39) can't drive a servo. Skip this one instead of
+         * letting ESP_ERROR_CHECK abort the whole boot and take the other servos down. */
+        if (!GPIO_IS_VALID_OUTPUT_GPIO(s->gpio)) {
+            ESP_LOGE(PWMTAG, "%s: GPIO %d is input-only on the ESP32 and cannot output PWM; "
+                             "this servo will NOT move. Rewire it to an output pin.",
+                     s->name, s->gpio);
+            continue;
+        }
 
         mcpwm_generator_config_t gen_config = { .gen_gpio_num = s->gpio };
         ESP_ERROR_CHECK(mcpwm_new_generator(oper, &gen_config, &s->gen));

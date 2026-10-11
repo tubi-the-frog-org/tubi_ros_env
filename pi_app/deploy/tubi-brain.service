@@ -1,7 +1,8 @@
 [Unit]
 Description=Tubi brain (pi_app: LLM + TTS + speaker + ESP32)
-After=network-online.target tubi-web.service
-Wants=network-online.target tubi-web.service
+# Starts right after the website; it retries its websocket (and every cloud call) on its own if the network is late.
+After=network.target tubi-web.service
+Wants=tubi-web.service
 
 [Service]
 User=maxwelllokshin

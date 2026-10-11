@@ -94,18 +94,33 @@ def test_tts_bytes_per_second_follows_output_format():
     assert TtsClient("u", "m", "k").bytes_per_second == 16000
 
 
-def test_uart_loopback_tool_passes_on_a_perfect_loop_and_fails_on_a_dead_one(monkeypatch):
+def test_uart_loopback_tool_passes_on_a_perfect_loop_and_fails_on_dead_or_lossy_lines(monkeypatch, capsys):
     import tools.check_pi_uart as tool
 
-    assert tool.loopback("loop://", 921600) is True
+    assert tool.loopback("loop://", 921600, settle=0.2) is True
+    real_for_url = tool.serial.serial_for_url      # the fake below must not call the function we patch
 
-    class DeadLine:  # TX and RX not jumpered: everything written vanishes
+    class FakeLine:
+        """Wraps a loop:// port; `drop_every` drops every Nth byte, 0 means a dead line (nothing returns)."""
+        def __init__(self, drop_every):
+            self.inner = real_for_url("loop://", 921600, timeout=0.2)
+            self.drop_every, self.n = drop_every, 0
         def __enter__(self): return self
-        def __exit__(self, *a): return False
-        def reset_input_buffer(self): pass
-        def write(self, b): pass
-        def flush(self): pass
-        def read(self, n): return b""
+        def __exit__(self, *a): self.inner.close(); return False
+        def reset_input_buffer(self): self.inner.reset_input_buffer()
+        def flush(self): self.inner.flush()
+        def read(self, n): return self.inner.read(n)
+        def write(self, data):
+            if self.drop_every == 0:
+                return len(data)
+            kept = bytearray()
+            for b in data:
+                self.n += 1
+                if self.n % self.drop_every:
+                    kept.append(b)
+            return self.inner.write(bytes(kept))
 
-    monkeypatch.setattr(tool.serial, "serial_for_url", lambda *a, **k: DeadLine())
-    assert tool.loopback("/dev/serial0", 921600) is False
+    for drop_every, message in ((0, "nothing back"), (4, "lost or changed")):
+        monkeypatch.setattr(tool.serial, "serial_for_url", lambda *a, _d=drop_every, **k: FakeLine(_d))
+        assert tool.loopback("/dev/serial0", 921600, size=1024, settle=0.2) is False
+        assert message in capsys.readouterr().out

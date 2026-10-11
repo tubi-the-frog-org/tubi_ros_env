@@ -30,7 +30,6 @@ from pi_app.audio_player import AudioPlayer
 from pi_app.conversation_session import ConversationSession
 from pi_app.decision_client import DecisionClient
 from pi_app.dotenv import load_secrets_env
-from pi_app.snacks import SnacksStore
 from pi_app.tts_client import TtsClient
 
 
@@ -74,7 +73,6 @@ def main():
     with microphone as source:
         recognizer.adjust_for_ambient_noise(source)
 
-    snacks_store = SnacksStore(os.environ.get("SNACKS_CONFIG_PATH", "config/snacks.json"))
     decision_client = DecisionClient(
         base_url=os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1"),
         model=os.environ.get("LLM_MODEL", "gpt-5-nano"),
@@ -89,7 +87,7 @@ def main():
     audio_player = AudioPlayer()
 
     session_id = str(uuid.uuid4())
-    session = ConversationSession(session_id, decision_client, snacks_store.current)
+    session = ConversationSession(session_id, decision_client)
 
     def speak(text: str):
         print(f"\nTubi: {text}\n")

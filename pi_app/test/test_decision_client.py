@@ -2,10 +2,11 @@ import json
 
 import pytest
 
-from pi_app.snacks import Line, Snack
+from fake_decision_server import FakeDecisionServer
 from pi_app.decision_client import (
-    DecisionInvalidResponseError,
+    ConversationTurn,
     DecisionClient,
+    DecisionInvalidResponseError,
     DecisionRequestError,
     DecisionTimeoutError,
     DecisionValidationError,
@@ -14,292 +15,170 @@ from pi_app.decision_client import (
     build_system_prompt,
     validate_reply,
 )
-from fake_decision_server import FakeDecisionServer
-
-COOKIES = Snack(id="cookies", label="Cookies", slot=1,
-                 aliases=["biscuit"], tags=["sweet"], lines=[Line(id="cookies_1", text="cookies!")])
-CHIPS = Snack(id="chips", label="Chips", slot=3,
-              aliases=["crisps"], tags=["salty", "crunchy"], lines=[Line(id="chips_1", text="chips!")])
-SNACKS = [COOKIES, CHIPS]
 
 
 def _client(url, timeout_s=5.0):
     return DecisionClient(base_url=url, model="gpt-5-nano", api_key="sk-test", timeout_s=timeout_s)
 
 
-def test_build_schema_shape():
-    schema = build_schema(["cookies", "chips"])
-    assert schema["properties"]["snack"]["enum"] == ["cookies", "chips"]
-    assert schema["required"] == ["snack", "reply"]
-    assert schema["additionalProperties"] is False
+def _history():
+    return [{"role": "system", "content": "x"}, {"role": "user", "content": "hello"}]
 
 
-def test_build_system_prompt_includes_tags_and_injection_defense():
-    prompt = build_system_prompt(SNACKS)
-    assert "chips" in prompt and "crunchy" in prompt
-    assert "DATA" in prompt
+def _turn(done=False, magic_type="", magic_level=0, reply="Tell me about yourself.", reasoning="r"):
+    return {"status": 200, "content": json.dumps({
+        "reasoning": reasoning, "done": done, "magic_type": magic_type, "magic_level": magic_level, "reply": reply,
+    })}
 
 
-def test_validate_reply_rejects_empty():
+# ---- the prompt and the schemas ---------------------------------------------------------------------
+
+def test_the_prompt_defines_the_reading_and_defends_against_injection():
+    prompt = build_system_prompt()
+    assert "DATA" in prompt                                   # guest words are data, never instructions
+    assert "magic_type" in prompt and "magic_level" in prompt
+    assert "whole number from 1 to 10" in prompt             # the code validates 1..10, so the prompt must say so
+    assert "done=true" in prompt and "done=false" in prompt
+    assert "snack" not in prompt.lower()                      # the quiz is no longer about snacks
+    assert "{" not in prompt and "}" not in prompt            # nothing a format string could choke on
+
+
+def test_the_one_shot_schema():
+    schema = build_schema()
+    assert list(schema["properties"]) == ["magic_type", "magic_level", "reply"]
+    assert schema["required"] == ["magic_type", "magic_level", "reply"] and schema["additionalProperties"] is False
+
+
+def test_the_conversation_schema_reasons_first():
+    schema = build_conversation_schema()
+    assert list(schema["properties"])[0] == "reasoning"       # the model writes fields in order
+    assert schema["required"] == ["reasoning", "done", "magic_type", "magic_level", "reply"]
+    assert schema["properties"]["magic_level"] == {"type": "integer"} and schema["additionalProperties"] is False
+
+
+@pytest.mark.parametrize("reply", ["", "visit http://example.com", "see www.example.com", "x" * 281])
+def test_validate_reply_rejects_bad_replies(reply):
     with pytest.raises(DecisionValidationError):
-        validate_reply("", CHIPS)
+        validate_reply(reply)
 
 
-def test_validate_reply_rejects_too_long():
-    with pytest.raises(DecisionValidationError):
-        validate_reply("chips " * 100, CHIPS)
+def test_validate_reply_accepts_a_normal_line():
+    validate_reply("You are a Swamp Trickster, level seven. Hmph.")
 
 
-def test_validate_reply_rejects_url():
-    with pytest.raises(DecisionValidationError):
-        validate_reply("The chips await! visit http://example.com", CHIPS)
+# ---- HTTP behaviour -----------------------------------------------------------------------------------
+
+def test_sends_a_bearer_key_a_fresh_connection_and_a_strict_schema():
+    with FakeDecisionServer(responses=[_turn()]) as server:
+        _client(server.url).converse(_history())
+        headers, payload = server.last_headers, server.last_payload
+    assert headers["authorization"] == "Bearer sk-test"
+    assert headers["connection"].lower() == "close"            # never reuse a connection the hotspot may have dropped
+    assert payload["reasoning_effort"] == "low"
+    fmt = payload["response_format"]["json_schema"]
+    assert fmt["strict"] is True and fmt["schema"] == build_conversation_schema()
 
 
-def test_validate_reply_rejects_missing_snack_mention():
-    with pytest.raises(DecisionValidationError):
-        validate_reply("A mystical treat awaits you, traveler!", CHIPS)
-
-
-def test_validate_reply_accepts_label_or_alias_mention():
-    validate_reply("The crisps call to you!", CHIPS)  # alias
-    validate_reply("Chips, destiny demands it!", CHIPS)  # label
-
-
-def test_validate_reply_accepts_punctuation_variation_in_label():
-    # a real failure: label "m&ms" didn't match a reply naturally written
-    # "M&M's" (apostrophe) -- punctuation differences shouldn't matter.
-    mms = Snack(id="m&ms", label="m&ms", slot=1, aliases=[], tags=[], lines=[])
-    validate_reply("Your fate is sealed: M&M's await you, traveler!", mms)
-
-
-def test_choose_snack_and_reply_success():
-    with FakeDecisionServer(responses=[{"status": 200, "snack": "chips", "reply": "The crunchy chips await!"}]) as server:
-        client = _client(server.url)
-        snack_id, reply = client.choose_snack_and_reply("something crunchy", SNACKS)
-        assert snack_id == "chips"
-        assert reply == "The crunchy chips await!"
-
-
-def test_choose_snack_and_reply_invalid_snack_raises():
-    with FakeDecisionServer(responses=[{"status": 200, "snack": "not_a_snack", "reply": "whatever"}]) as server:
-        client = _client(server.url)
-        with pytest.raises(DecisionInvalidResponseError):
-            client.choose_snack_and_reply("hello", SNACKS)
-
-
-def test_choose_snack_and_reply_bad_json_content_raises():
-    with FakeDecisionServer(responses=[{"status": 200, "content": "not json"}]) as server:
-        client = _client(server.url)
-        with pytest.raises(DecisionInvalidResponseError):
-            client.choose_snack_and_reply("hello", SNACKS)
-
-
-def test_choose_snack_and_reply_validation_failure_raises():
-    with FakeDecisionServer(responses=[{"status": 200, "snack": "chips", "reply": "a vague mystical thing"}]) as server:
-        client = _client(server.url)
-        with pytest.raises(DecisionValidationError):
-            client.choose_snack_and_reply("hello", SNACKS)
-
-
-def test_retries_once_on_429_then_succeeds():
-    with FakeDecisionServer(responses=[
-        {"status": 429},
-        {"status": 200, "snack": "chips", "reply": "Chips, as fate decreed!"},
-    ]) as server:
-        client = _client(server.url)
-        snack_id, reply = client.choose_snack_and_reply("hello", SNACKS)
-        assert snack_id == "chips"
+def test_a_429_is_retried_once_and_then_succeeds():
+    with FakeDecisionServer(responses=[{"status": 429}, _turn(reply="Hmph.")]) as server:
+        assert _client(server.url).converse(_history()).reply_text == "Hmph."
         assert server.call_count == 2
 
 
-def test_raises_after_retry_also_fails():
+def test_two_429s_raise_a_request_error():
     with FakeDecisionServer(responses=[{"status": 429}, {"status": 429}]) as server:
-        client = _client(server.url)
         with pytest.raises(DecisionRequestError):
-            client.choose_snack_and_reply("hello", SNACKS)
-        assert server.call_count == 2  # exactly one retry, not more
+            _client(server.url).converse(_history())
+        assert server.call_count == 2
 
 
-def test_non_retryable_error_status_raises_without_retry():
+def test_a_non_retryable_error_is_not_retried():
     with FakeDecisionServer(responses=[{"status": 400}]) as server:
-        client = _client(server.url)
         with pytest.raises(DecisionRequestError):
-            client.choose_snack_and_reply("hello", SNACKS)
+            _client(server.url).converse(_history())
         assert server.call_count == 1
 
 
-def test_timeout_raises():
-    with FakeDecisionServer(responses=[{"status": 200, "snack": "chips", "reply": "chips!"}], delay_s=1.0) as server:
-        client = _client(server.url, timeout_s=0.2)
+def test_a_timeout_raises_a_timeout_error():
+    with FakeDecisionServer(responses=[_turn()], delay_s=1.0) as server:
         with pytest.raises(DecisionTimeoutError):
-            client.choose_snack_and_reply("hello", SNACKS)
+            _client(server.url, timeout_s=0.2).converse(_history())
 
 
-def test_connection_refused_raises():
-    client = DecisionClient(base_url="http://127.0.0.1:1", model="gpt-5-nano", api_key="sk-test", timeout_s=2)
+def test_connection_refused_raises_a_request_error():
     with pytest.raises(DecisionRequestError):
-        client.choose_snack_and_reply("hello", SNACKS)
+        _client("http://127.0.0.1:1", timeout_s=2).converse(_history())
 
 
-# ---- converse() ----
+# ---- converse(): the multi-turn call ---------------------------------------------------------------------
 
-def _history():
-    return [
-        {"role": "system", "content": build_system_prompt(SNACKS)},
-        {"role": "user", "content": "(session start)"},
-    ]
-
-
-def test_build_conversation_schema_shape():
-    schema = build_conversation_schema(["cookies", "chips"])
-    assert schema["properties"]["snacks"] == {"type": "array", "items": {"type": "string", "enum": ["cookies", "chips"]}}
-    assert schema["properties"]["done"] == {"type": "boolean"}
-    assert set(schema["properties"]["percentages"]["properties"]) == {"cookies", "chips"}
-    assert schema["required"] == ["reasoning", "done", "snacks", "reply", "percentages"]
-    assert list(schema["properties"])[0] == "reasoning"  # reasons before it commits to scores
+def test_a_normal_turn_keeps_talking_and_has_no_reading_yet():
+    with FakeDecisionServer(responses=[_turn(reply="Nice to meet you. If you found a door in a pond?")]) as server:
+        turn = _client(server.url).converse(_history())
+    assert turn == ConversationTurn(reply_text="Nice to meet you. If you found a door in a pond?", done=False,
+                                    magic_type=None, magic_level=None, reasoning="r")
 
 
-def test_build_conversation_schema_does_not_force_a_reveal():
-    schema = build_conversation_schema(["cookies", "chips"])
-    assert schema["properties"]["done"] == {"type": "boolean"}
-    assert schema["properties"]["snacks"]["items"]["enum"] == ["cookies", "chips"]
+def test_the_reveal_returns_the_type_and_level():
+    reveal = _turn(done=True, magic_type=" Swamp Trickster ", magic_level=7, reply="Swamp Trickster, level seven. Hmph.")
+    with FakeDecisionServer(responses=[reveal]) as server:
+        turn = _client(server.url).converse(_history())
+    assert turn.done and turn.magic_type == "Swamp Trickster" and turn.magic_level == 7
 
 
-def _not_done_content(reply="Greetings! Tell me about yourself."):
-    return json.dumps({"done": False, "snacks": [], "reply": reply, "percentages": {"cookies": 0, "chips": 0}})
+def test_a_stray_assessment_before_the_reveal_is_ignored_not_fatal():
+    """A model that fills in the fields but leaves done=false hasn't revealed yet: keep talking."""
+    with FakeDecisionServer(responses=[_turn(done=False, magic_type="Swamp Trickster", magic_level=7)]) as server:
+        turn = _client(server.url).converse(_history())
+    assert turn.done is False and turn.magic_type is None and turn.magic_level is None
 
 
-def _done_content(snacks=("chips",), reply="The crunchy chips await!", percentages=None):
-    percentages = percentages if percentages is not None else {"cookies": 20, "chips": 80}
-    return json.dumps({"done": True, "snacks": list(snacks), "reply": reply, "percentages": percentages})
+@pytest.mark.parametrize("given,expected", [(0, 1), (11, 10), (-3, 1), (99, 10)])
+def test_an_out_of_range_level_is_clamped_not_fatal(given, expected):
+    with FakeDecisionServer(responses=[_turn(done=True, magic_type="Moon Mage", magic_level=given, reply="Moon Mage.")]) as server:
+        assert _client(server.url).converse(_history()).magic_level == expected
 
 
-def test_converse_not_done_returns_reply_without_snacks_or_percentages():
-    with FakeDecisionServer(responses=[{"status": 200, "content": _not_done_content()}]) as server:
-        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
-        turn = client.converse(_history(), SNACKS)
-        assert turn.done is False
-        assert turn.reply_text == "Greetings! Tell me about yourself."
-        assert turn.snack_ids == []
-        assert turn.percentages is None
+def test_an_over_long_reveal_is_trimmed_to_a_sentence_not_rejected():
+    long_reply = "You are a Swamp Trickster, level seven. " + "The swamp approves of this. " * 20
+    with FakeDecisionServer(responses=[_turn(done=True, magic_type="Swamp Trickster", magic_level=7, reply=long_reply)]) as server:
+        turn = _client(server.url).converse(_history())
+    assert turn.done and len(turn.reply_text) <= 280 and turn.reply_text.endswith(".")
 
 
-def test_converse_done_returns_clamped_independent_percentages():
-    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(percentages={"cookies": 20, "chips": 150})}]) as server:
-        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
-        turn = client.converse(_history(), SNACKS)
-        assert turn.done is True
-        assert turn.snack_ids == ["chips"]
-        # NOT rescaled to sum to 100 -- independent scores, just clamped to [0, 100]
-        assert turn.percentages == {"cookies": 20.0, "chips": 100.0}
+def test_an_over_long_chat_reply_is_trimmed_not_rejected():
+    with FakeDecisionServer(responses=[_turn(reply="Hmph. " * 200)]) as server:
+        turn = _client(server.url).converse(_history())
+    assert turn.done is False and 0 < len(turn.reply_text) <= 500
 
 
-def test_converse_done_can_choose_multiple_snacks():
-    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(
-        snacks=["cookies", "chips"], reply="Both cookies and chips call to you!",
-        percentages={"cookies": 70, "chips": 65},
-    )}]) as server:
-        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
-        turn = client.converse(_history(), SNACKS)
-        assert turn.snack_ids == ["cookies", "chips"]
-        assert turn.percentages == {"cookies": 70.0, "chips": 65.0}
+@pytest.mark.parametrize("content,error", [
+    ("not json at all", DecisionInvalidResponseError),
+    (json.dumps({"reasoning": "r", "done": False}), DecisionInvalidResponseError),                 # missing fields
+    (json.dumps({"reasoning": "r", "done": "yes", "magic_type": "", "magic_level": 0, "reply": "x"}), DecisionInvalidResponseError),
+    (json.dumps({"reasoning": "r", "done": True, "magic_type": "", "magic_level": 5, "reply": "x"}), DecisionInvalidResponseError),
+    (json.dumps({"reasoning": "r", "done": True, "magic_type": "Mage", "magic_level": "five", "reply": "x"}), DecisionInvalidResponseError),
+    (json.dumps({"reasoning": "r", "done": True, "magic_type": "Mage", "magic_level": True, "reply": "x"}), DecisionInvalidResponseError),
+    (json.dumps({"reasoning": "r", "done": False, "magic_type": "", "magic_level": 0, "reply": ""}), DecisionValidationError),
+    (json.dumps({"reasoning": "r", "done": False, "magic_type": "", "magic_level": 0, "reply": "go to http://x.com"}), DecisionValidationError),
+])
+def test_unusable_responses_raise_the_right_error(content, error):
+    with FakeDecisionServer(responses=[{"status": 200, "content": content}]) as server:
+        with pytest.raises(error):
+            _client(server.url).converse(_history())
 
 
-def test_converse_done_with_all_zero_percentages():
-    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(percentages={"cookies": 0, "chips": 0})}]) as server:
-        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
-        turn = client.converse(_history(), SNACKS)
-        assert turn.percentages == {"cookies": 0.0, "chips": 0.0}
+# ---- assess_magic_user(): the one-shot call ------------------------------------------------------------------
+
+def test_the_one_shot_returns_type_level_and_reply():
+    ok = {"status": 200, "magic_type": "Owl Whisperer", "magic_level": 4, "reply": "An owl, eh? Level four."}
+    with FakeDecisionServer(responses=[ok]) as server:
+        assert _client(server.url).assess_magic_user("I'd be an owl") == ("Owl Whisperer", 4, "An owl, eh? Level four.")
 
 
-def test_converse_done_no_snacks_chosen_raises():
-    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(snacks=[])}]) as server:
-        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
+@pytest.mark.parametrize("magic_type,magic_level", [("", 4), ("Mage", 0), ("Mage", 11), (None, 4)])
+def test_the_one_shot_still_rejects_a_bad_assessment(magic_type, magic_level):
+    bad = {"status": 200, "magic_type": magic_type, "magic_level": magic_level, "reply": "x"}
+    with FakeDecisionServer(responses=[bad]) as server:
         with pytest.raises(DecisionInvalidResponseError):
-            client.converse(_history(), SNACKS)
-
-
-def test_converse_done_invalid_snack_raises():
-    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(snacks=["not_a_snack"])}]) as server:
-        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
-        with pytest.raises(DecisionInvalidResponseError):
-            client.converse(_history(), SNACKS)
-
-
-def test_converse_done_reply_not_mentioning_any_chosen_snack_raises():
-    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(reply="A vague mystical thing.")}]) as server:
-        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
-        with pytest.raises(DecisionValidationError):
-            client.converse(_history(), SNACKS)
-
-
-def test_converse_done_reply_mentioning_just_one_of_several_chosen_snacks_is_ok():
-    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(
-        snacks=["cookies", "chips"], reply="Chips await you, traveler!",
-    )}]) as server:
-        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
-        turn = client.converse(_history(), SNACKS)
-        assert turn.snack_ids == ["cookies", "chips"]
-
-
-def test_converse_not_done_overlong_reply_is_truncated_not_discarded():
-    # A real model exceeded the cap on the very first (intro) turn in practice;
-    # discarding the whole turn meant the conversation never advanced. Truncate instead.
-    with FakeDecisionServer(responses=[{"status": 200, "content": _not_done_content(reply="word " * 200)}]) as server:
-        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
-        turn = client.converse(_history(), SNACKS)
-        assert turn.done is False
-        assert len(turn.reply_text) <= 500
-        assert turn.reply_text  # not empty
-
-
-def test_converse_not_done_truncates_at_sentence_boundary_when_possible():
-    long_reply = ("Greetings, traveler! " * 20) + ("Extra padding with no clean break here" * 20)
-    with FakeDecisionServer(responses=[{"status": 200, "content": _not_done_content(reply=long_reply)}]) as server:
-        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
-        turn = client.converse(_history(), SNACKS)
-        # should cut at the last "! " sentence boundary, not mid-word into the padding
-        assert turn.reply_text.endswith("traveler!")
-        assert len(turn.reply_text) <= 500
-
-
-def test_converse_empty_reply_raises():
-    with FakeDecisionServer(responses=[{"status": 200, "content": _not_done_content(reply="")}]) as server:
-        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
-        with pytest.raises(DecisionValidationError):
-            client.converse(_history(), SNACKS)
-
-
-def test_converse_bad_json_content_raises():
-    with FakeDecisionServer(responses=[{"status": 200, "content": "not json"}]) as server:
-        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
-        with pytest.raises(DecisionInvalidResponseError):
-            client.converse(_history(), SNACKS)
-
-
-def test_converse_returns_private_reasoning_and_accepts_it_missing():
-    with FakeDecisionServer(responses=[
-        {"status": 200, "content": json.dumps({**json.loads(_not_done_content()), "reasoning": "Opened the door: curious."})},
-        {"status": 200, "content": _not_done_content()},  # an older/other model that omits it
-    ]) as server:
-        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
-        assert client.converse(_history(), SNACKS).reasoning == "Opened the door: curious."
-        assert client.converse(_history(), SNACKS).reasoning == ""
-
-
-def test_converse_done_accepts_a_reveal_that_ties_the_pick_to_an_answer():
-    # The prompt's own example reveal is 161 chars; the old 160 cap rejected it.
-    reply = ("WAZAH! You'd rather study ancient history than predict the future? "
-             "Take Chips and the Cookies too. Baked according to a simple, timeless alchemy from centuries past!")
-    assert 160 < len(reply) < 280
-    with FakeDecisionServer(responses=[{"status": 200, "content": _done_content(reply=reply)}]) as server:
-        client = DecisionClient(base_url=server.url, model="gpt-5-nano", api_key="sk-test", timeout_s=5)
-        assert client.converse(_history(), SNACKS).done is True
-
-
-def test_system_prompt_lists_each_snacks_vibe_and_scratchpad_rule():
-    snacks = [Snack(id="chips", label="Chips", slot=3, tags=["salty"], vibe="grounded and dry", lines=[])]
-    prompt = build_system_prompt(snacks)
-    assert "vibe: grounded and dry" in prompt
-    assert '"reasoning"' in prompt
-    assert "(no speech detected)" in prompt
+            _client(server.url).assess_magic_user("hi")

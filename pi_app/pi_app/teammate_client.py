@@ -5,10 +5,11 @@ client, so this is just another client on the same socket.
 
 Drives the multi-turn ConversationSession (conversation_session.py):
 `session:start` begins one, `transcript` feeds it, `session:end`
-clears it. Sends a `speak` message per turn and an extended `display`
-message (with percentages) on reveal.
+clears it. Sends a `speak` message per turn and a `display` message
+(`kind: "result"`, with the guest's magic_type and magic_level) on the reveal.
+Nothing is dispensed: the reading is spoken and shown, that's all.
 
-Scope note: `speak` and `display.payload.percentages` are NOT yet in
+Scope note: `speak` and the `display` result fields are NOT yet in
 website/docs/message-contract.md -- that contract only covers the old
 one-shot shape. This is a proposal (see
 pi_app/docs/multi_turn_contract_proposal.md) for what the website side
@@ -33,7 +34,6 @@ from pi_app.conversation_session import ConversationSession, QuizResult
 from pi_app.decision_client import DecisionClient
 from pi_app.esp32_link import EspLink, estimate_audio_seconds, word_durations_ms
 from pi_app.request_budget import CharacterBudget, RequestBudget
-from pi_app.snacks import SnacksStore
 from pi_app.tts_client import TtsClient, TtsError
 
 RECONNECT_DELAY_S = 3.0
@@ -51,7 +51,6 @@ class TeammateClient:
         character_budget: CharacterBudget,
         esp32_link: EspLink,
         audio_player: AudioPlayer,
-        snacks_store: SnacksStore,
         reconnect_delay_s: float = RECONNECT_DELAY_S,
         quiz_result_path: str = QUIZ_RESULT_PATH,
         logger: logging.Logger | None = None,
@@ -63,7 +62,6 @@ class TeammateClient:
         self._character_budget = character_budget
         self._esp32_link = esp32_link
         self._audio_player = audio_player
-        self._snacks_store = snacks_store
         self._reconnect_delay_s = reconnect_delay_s
         self._quiz_result_path = quiz_result_path
         self._logger = logger or logging.getLogger(__name__)
@@ -123,7 +121,7 @@ class TeammateClient:
             self._logger.info(f"session:start {session_id}")
             self._pending.clear()
             async with self._turn_lock:
-                self._session = ConversationSession(session_id, self._decision_client, self._snacks_store.current)
+                self._session = ConversationSession(session_id, self._decision_client)
                 reply = await self._run_llm(self._session.start)
                 await self._speak_turn(ws, reply)
             return
@@ -204,21 +202,10 @@ class TeammateClient:
             "type": "display",
             "payload": {
                 "kind": "result",
-                "snacks": [s.label for s in result.chosen_snacks],
-                "percentages": result.percentages,
+                "magic_type": result.magic_type,
+                "magic_level": result.magic_level,
             },
         })
-
-        # The ESP32 runs the whole sequence itself (rotate to the bin, open
-        # the trap door, close it), so this is one command. Only one funnel
-        # can be targeted, so the first chosen snack's slot wins even when
-        # several snacks scored high enough to be named.
-        slot = result.chosen_snacks[0].slot
-        if 1 <= slot <= 4:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self._esp32_link.dispense, slot)
-        else:
-            self._logger.warning(f"chosen snack has no valid bin (slot={slot}); not dispensing")
 
         try:
             with open(self._quiz_result_path, "w") as f:
@@ -237,8 +224,6 @@ def main():
 
     load_secrets_env() # load the secrets
 
-    snacks_path = os.environ.get("SNACKS_CONFIG_PATH", "config/snacks.json") # the place where snacks are stored
-    snacks_store = SnacksStore(snacks_path)
  
     decision_client = DecisionClient( # cloud based llm we are using for reasoning
         base_url=os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1"),
@@ -267,7 +252,6 @@ def main():
         character_budget=CharacterBudget(daily_limit=int(os.environ.get("TTS_DAILY_CHAR_CAP", "20000"))),
         esp32_link=esp32_link,
         audio_player=audio_player,
-        snacks_store=snacks_store,
     )
     asyncio.run(client.run_forever())
 

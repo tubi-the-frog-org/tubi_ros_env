@@ -95,6 +95,16 @@ const sessionLock = new SessionLock({
 });
 let devBusySessionId = null;
 
+// Minimal operational logging (journald adds the timestamps). Never logs what a guest said, only that it happened.
+const log = (...args) => console.log(...args);
+const teammateCount = () => [...wss.clients].filter((c) => c.readyState === 1 && c.role === 'teammate').length;
+// sessionLock.expireIfNeeded() with a log line, so a session that dies is never a silent mystery.
+const expireIfNeeded = () => {
+  const expired = sessionLock.expireIfNeeded();
+  if (expired) log('session EXPIRED: no heartbeat from the guest\'s page within the idle timeout (or max duration reached)');
+  return expired;
+};
+
 const clearExpiredDevBusy = () => {
   if (devBusySessionId && !sessionLock.isOwner(devBusySessionId)) {
     devBusySessionId = null;
@@ -123,6 +133,7 @@ const toTeammate = (type, payload = {}) => {
 };
 
 const finishSession = () => {
+  log('session closed');
   resetTranscriptFile();
   toTeammate('session:end');
 };
@@ -132,7 +143,7 @@ const publishState = () => {
 };
 
 const expiryTimer = setInterval(() => {
-  if (sessionLock.expireIfNeeded()) {
+  if (expireIfNeeded()) {
     clearExpiredDevBusy();
     finishSession();
     publishState();
@@ -143,7 +154,7 @@ expiryTimer.unref();
 app.use(express.json({ limit: '10mb' }));
 
 app.get('/api/health', (_, res) => {
-  if (sessionLock.expireIfNeeded()) {
+  if (expireIfNeeded()) {
     finishSession();
     publishState();
   }
@@ -152,7 +163,7 @@ app.get('/api/health', (_, res) => {
 });
 
 app.post('/api/session/start', (_, res) => {
-  if (sessionLock.expireIfNeeded()) {
+  if (expireIfNeeded()) {
     finishSession();
     publishState();
   }
@@ -162,13 +173,14 @@ app.post('/api/session/start', (_, res) => {
   }
 
   resetTranscriptFile();
+  log(`session started (${String(session.sessionId).slice(0, 8)}); brain connected: ${teammateCount() > 0}`);
   toTeammate('session:start', { sessionId: session.sessionId });
   publishState();
   res.json({ ok: true, ...session, status: 'active' });
 });
 
 app.post('/api/session/resume', (req, res) => {
-  if (sessionLock.expireIfNeeded()) {
+  if (expireIfNeeded()) {
     finishSession();
     publishState();
   }
@@ -181,7 +193,7 @@ app.post('/api/session/resume', (req, res) => {
 });
 
 app.post('/api/session/heartbeat', (req, res) => {
-  if (sessionLock.expireIfNeeded()) {
+  if (expireIfNeeded()) {
     finishSession();
     publishState();
   }
@@ -193,7 +205,7 @@ app.post('/api/session/heartbeat', (req, res) => {
 });
 
 app.post('/api/session/end', (req, res) => {
-  if (sessionLock.expireIfNeeded()) {
+  if (expireIfNeeded()) {
     finishSession();
     publishState();
   }
@@ -223,7 +235,7 @@ app.post('/api/dev/session/busy', (req, res) => {
     return res.status(404).json({ ok: false, error: 'not found' });
   }
 
-  if (sessionLock.expireIfNeeded()) {
+  if (expireIfNeeded()) {
     finishSession();
     publishState();
   }
@@ -253,8 +265,9 @@ app.post('/api/dev/session/busy', (req, res) => {
 
 app.post('/api/transcribe', async (req, res) => {
   try {
-    if (sessionLock.expireIfNeeded()) publishState();
+    if (expireIfNeeded()) publishState();
     if (!sessionLock.heartbeat(req.body?.sessionId)) {
+      log('transcribe REJECTED: no active session for this tab (expired, or a stale/other tab)');
       return res.status(409).json({ ok: false, error: 'active session required' });
     }
 
@@ -303,10 +316,14 @@ app.post('/api/transcribe', async (req, res) => {
     // system prompt knows to answer with "what was that?" instead of leaving the
     // guest in dead air with a locked-out button.
     if (!STT_FAILURE_TEXT.test(result.text ?? '')) {
+      log(`transcribed ${String(result.text ?? '').length} chars${result.text ? '' : ' (silence)'}; forwarding to the brain (${teammateCount()} connected)`);
       toTeammate('transcript', { text: result.text || NO_SPEECH_MARKER, isFinal: true, timestamp: Date.now() });
+    } else {
+      log('transcription failed inside the STT worker; not forwarded to the brain');
     }
     res.json({ ok: true, text });
   } catch (error) {
+    console.error('transcribe FAILED:', error instanceof Error ? error.message : error);
     res.status(500).json({
       ok: false,
       error: error instanceof Error ? error.message : 'transcription failed'
@@ -334,6 +351,8 @@ app.post('/api/dev/transcript', (req, res) => {
 wss.on('connection', (socket, req) => {
   const role = new URL(req.url ?? '/', 'http://localhost').searchParams.get('role');
   socket.role = role === 'teammate' ? 'teammate' : 'browser';
+  log(`ws connected (${socket.role})`);
+  socket.on('close', () => log(`ws closed (${socket.role})`));
   socket.send(JSON.stringify({ type: 'session-state', payload: sessionLock.snapshot() }));
   socket.on('message', (raw) => {
     try {

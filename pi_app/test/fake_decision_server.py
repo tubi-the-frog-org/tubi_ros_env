@@ -16,14 +16,16 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 class FakeDecisionServer:
     def __init__(self, responses: list[dict] | None = None, delay_s: float = 0.0):
         """Each entry in `responses` is one of:
-          {"status": 200, "snack": "chips", "reply": "..."}  -- valid structured content
+          {"status": 200, "magic_type": "Swamp Trickster", "magic_level": 5, "reply": "..."}  -- valid structured content
           {"status": 200, "content": "<raw string>"}          -- custom/malformed content
           {"status": 429}  or  {"status": 500}                -- error, empty-ish body
         Consumed in request order; the last entry repeats once the list is exhausted.
         """
-        self.responses = responses or [{"status": 200, "snack": "none", "reply": "ok"}]
+        self.responses = responses or [{"status": 200, "magic_type": "Swamp Trickster", "magic_level": 5, "reply": "ok"}]
         self.delay_s = delay_s
         self.call_count = 0
+        self.last_payload: dict | None = None    # JSON body of the most recent request
+        self.last_headers: dict | None = None    # its headers, lower-cased
         self._lock = threading.Lock()
         self._server: HTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -53,7 +55,12 @@ class FakeDecisionServer:
                     return
 
                 length = int(self.headers.get("Content-Length", 0))
-                self.rfile.read(length)
+                body = self.rfile.read(length)
+                server.last_headers = {k.lower(): v for k, v in self.headers.items()}
+                try:
+                    server.last_payload = json.loads(body)
+                except ValueError:
+                    server.last_payload = None
 
                 if server.delay_s:
                     time.sleep(server.delay_s)
@@ -69,7 +76,7 @@ class FakeDecisionServer:
                         if "content" in entry:
                             content = entry["content"]
                         else:
-                            content = json.dumps({"snack": entry.get("snack"), "reply": entry.get("reply", "")})
+                            content = json.dumps({"magic_type": entry.get("magic_type"), "magic_level": entry.get("magic_level"), "reply": entry.get("reply", "")})
                         body = json.dumps({"choices": [{"message": {"content": content}}]})
                     else:
                         body = json.dumps({"error": {"message": "fake error"}})

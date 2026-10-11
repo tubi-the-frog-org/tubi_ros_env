@@ -8,14 +8,15 @@ from __future__ import annotations
 
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 
 class FakeTtsServer:
-    def __init__(self, audio_bytes: bytes = b"\xff\xfbfake-mp3-bytes", status_code: int = 200, delay_s: float = 0.0):
+    def __init__(self, audio_bytes: bytes = b"\xff\xfbfake-mp3-bytes", status_code: int = 200, delay_s: float = 0.0, slow_first_calls: int | None = None):
         self.audio_bytes = audio_bytes
         self.status_code = status_code
         self.delay_s = delay_s
+        self.slow_first_calls = slow_first_calls   # None: delay every call; N: only the first N calls hang
         self.call_count = 0
         self.last_path: str | None = None
         self.last_headers = None
@@ -50,7 +51,7 @@ class FakeTtsServer:
                     server.last_headers = {k.lower(): v for k, v in self.headers.items()}
                     server.last_payload = body
 
-                if server.delay_s:
+                if server.delay_s and (server.slow_first_calls is None or server.call_count <= server.slow_first_calls):
                     time.sleep(server.delay_s)
 
                 try:
@@ -65,7 +66,7 @@ class FakeTtsServer:
                 except (BrokenPipeError, ConnectionResetError):
                     pass  # client already gave up (e.g. timeout test)
 
-        self._server = HTTPServer(("127.0.0.1", 0), Handler)
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         return server

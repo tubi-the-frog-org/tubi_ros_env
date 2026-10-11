@@ -281,10 +281,13 @@ button {
   position: relative;
   z-index: 1;
   max-width: 82%;
-  color: #39162d;
+  color: #fff9e8;
+  font-family: 'Arial Black', 'Trebuchet MS', sans-serif;
   font-size: 2.45rem;
+  font-weight: 900;
   line-height: 1;
-  text-shadow: 0 1px rgba(255, 255, 255, 0.48);
+  -webkit-text-stroke: 1.25px rgba(48, 13, 39, 0.98);
+  text-shadow: 0 1px 0 #38112f, 0 3px 0 #38112f, 0 5px 4px rgba(24, 5, 24, 0.98), 0 9px 13px rgba(24, 5, 24, 0.9);
 }
 
 .state-busy .crystal-word {

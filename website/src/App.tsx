@@ -535,17 +535,6 @@ function App() {
               <span className="crystal-word">{orbText}</span>
             </span>
           </button>
-          <p className="crystal-hint">
-            {isCalibrating
-              ? 'Stay quiet for a moment'
-              : isRecording
-                ? 'Release when you are finished'
-                : sessionState === 'active'
-                  ? 'Press and hold to speak'
-                  : sessionState === 'busy'
-                    ? 'A guest is speaking with Tubi'
-                    : 'Touch the crystal to awaken Tubi'}
-          </p>
           {sessionState === 'active' && (
             <button className="end-session-button" type="button" onClick={endSession}>
               Let Tubi rest

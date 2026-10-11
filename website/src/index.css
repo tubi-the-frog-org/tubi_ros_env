@@ -306,18 +306,6 @@ button {
   pointer-events: none;
 }
 
-.crystal-hint {
-  position: relative;
-  z-index: 2;
-  min-height: 1.3rem;
-  margin: -0.3rem 0 0;
-  color: #eee1ab;
-  font-family: Georgia, serif;
-  font-size: 0.9rem;
-  text-align: center;
-  text-shadow: 0 2px 5px #09251d;
-}
-
 .end-session-button {
   min-height: 2.6rem;
   margin-top: 0.15rem;

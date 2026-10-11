@@ -104,7 +104,7 @@ class Esp32AudioPlayer:
 
         # Wait for the ESP32's 'D' (track finished); bail out after the
         # audio's expected length plus slack so a dead link can't hang a turn.
-        deadline = time.monotonic() + len(audio) / self._bytes_per_second + 10.0
+        deadline = time.monotonic() + len(audio) / self._bytes_per_second + 3.0
         while time.monotonic() < deadline:
             if self._conn.read(1) == b"D":
                 return

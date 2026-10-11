@@ -29,19 +29,17 @@ const extensionForMimeType = (mimeType: string) => {
 };
 
 const getSocketUrl = () => {
-  const host = window.location.hostname;
-  const port = window.location.port;
+  const { hostname, host, port, protocol } = window.location;
+  const wsProtocol = protocol === 'https:' ? 'wss' : 'ws';
 
-  const backendPort = port === '5173' || port === '4173' || !port
-    ? import.meta.env.VITE_BACKEND_PORT || '3000'
-    : port;
-  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-
-  if (host === 'localhost' || host === '127.0.0.1') {
-    return `${protocol}://localhost:${backendPort}`;
+  // Vite dev/preview servers don't host the socket; the Node backend does.
+  if (port === '5173' || port === '4173') {
+    return `${wsProtocol}://${hostname}:${import.meta.env.VITE_BACKEND_PORT || '3000'}`;
   }
 
-  return `${protocol}://${host}:${backendPort}`;
+  // Served by the Node server itself, directly or behind the HTTPS tunnel
+  // (no port in the URL): the socket lives on the same origin.
+  return `${wsProtocol}://${host}`;
 };
 
 function App() {

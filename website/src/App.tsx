@@ -479,8 +479,7 @@ function App() {
   return (
     <main className="wizard-screen">
       <header className="wizard-header">
-        <p className="brand-kicker">A little magic, just for you</p>
-        <h1>Tubi the<br />Wizard Frog</h1>
+        <h1 className="logo-heading"><img className="brand-logo" src="/Logo.png" alt="Tubi the Frog" /></h1>
         <span className={`connection-mark ${isSocketConnected ? 'connected' : ''}`} aria-label={isSocketConnected ? 'Connected' : 'Connecting'} />
       </header>
 
